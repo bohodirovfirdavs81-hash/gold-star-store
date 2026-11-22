@@ -1,0 +1,51 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #0b0b0d;
+  color: #ffffff;
+  font-family: Arial, sans-serif;
+}
+
+header {
+  padding: 25px 5px;
+}
+
+.logo {
+  color: #e9bd42;
+}
+
+.balance,
+.item,
+.support {
+  background: #19191d;
+  border: 1px solid #303034;
+  border-radius: 20px;
+}
+
+.balance {
+  padding: 22px;
+}
+
+.gold {
+  background: #e9bd42;
+  color: #151515;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.item {
+  color: white;
+  min-height: 125px;
+}
+
+.support {
+  padding: 22px;
+}
