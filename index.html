@@ -1,0 +1,144 @@
+
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gold Star</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #0b0b0d;
+      color: #ffffff;
+      font-family: Arial, sans-serif;
+    }
+
+    header {
+      padding: 25px 5px;
+    }
+
+    .logo {
+      color: #e9bd42;
+      font-size: 27px;
+      font-weight: bold;
+    }
+
+    .subtitle {
+      color: #999999;
+      margin-top: 8px;
+    }
+
+    .balance {
+      background: #1b1b1f;
+      border: 1px solid #303034;
+      border-radius: 22px;
+      padding: 22px;
+      margin: 15px 0 22px;
+    }
+
+    .muted {
+      color: #999999;
+    }
+
+    .amount {
+      font-size: 34px;
+      font-weight: bold;
+      margin: 12px 0 20px;
+    }
+
+    button {
+      cursor: pointer;
+      border: 0;
+      border-radius: 13px;
+      padding: 15px;
+      font-size: 16px;
+      font-weight: bold;
+    }
+
+    .gold {
+      width: 100%;
+      background: #e9bd42;
+      color: #151515;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .item {
+      background: #19191d;
+      border: 1px solid #303034;
+      border-radius: 18px;
+      padding: 24px 8px;
+      text-align: center;
+      color: white;
+      min-height: 125px;
+    }
+
+    .emoji {
+      display: block;
+      font-size: 32px;
+      margin-bottom: 12px;
+    }
+
+    .support {
+      margin-top: 18px;
+      background: #19191d;
+      border: 1px solid #303034;
+      border-radius: 18px;
+      padding: 22px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <div class="logo">⭐ GOLD STAR</div>
+    <div class="subtitle">Быстро. Безопасно. Выгодно.</div>
+  </header>
+
+  <section class="balance">
+    <div class="muted">Ваш баланс</div>
+    <div class="amount">0 сум</div>
+    <button class="gold" onclick="alert('Пополнение скоро будет доступно')">
+      Пополнить баланс
+    </button>
+  </section>
+
+  <div class="grid">
+    <button class="item" onclick="alert('Telegram Stars')">
+      <span class="emoji">⭐</span>
+      Telegram Stars
+    </button>
+
+    <button class="item" onclick="alert('Telegram Premium')">
+      <span class="emoji">👑</span>
+      Telegram Premium
+    </button>
+
+    <button class="item" onclick="alert('Telegram Gifts')">
+      <span class="emoji">🎁</span>
+      Telegram Gifts
+    </button>
+
+    <button class="item" onclick="alert('История покупок')">
+      <span class="emoji">◷</span>
+      История покупок
+    </button>
+  </div>
+
+  <div class="support">
+    <strong>🎧 Поддержка</strong>
+    <p class="muted">Есть вопросы? Мы поможем!</p>
+  </div>
+
+</body>
+</html>
