@@ -64,10 +64,12 @@ def webhook():
 
 if RENDER_URL:
     bot.remove_webhook()
-    bot.set_webhook(
+    result = bot.set_webhook(
         url=RENDER_URL + "/telegram-webhook",
         secret_token=WEBHOOK_SECRET
     )
+    print("WEBHOOK SET:", result)
+    print("WEBHOOK INFO:", bot.get_webhook_info())
 
 
 if __name__ == "__main__":
