@@ -28,7 +28,13 @@ def start(message):
             "/premium - Telegram Premium"
         )
 
+     print("START RECEIVED:", message.text)
+
+try:
     bot.send_message(message.chat.id, text)
+    print("MESSAGE SENT")
+except Exception as e:
+    print("SEND ERROR:", repr(e))
 
 
 @bot.message_handler(commands=["stars"])
