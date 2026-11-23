@@ -1,4 +1,3 @@
-
 import os
 import telebot
 from flask import Flask, request, abort
@@ -61,6 +60,7 @@ def home():
 
 @app.route("/telegram-webhook", methods=["POST"])
 def webhook():
+    print("WEBHOOK RECEIVED")
     if WEBHOOK_SECRET:
         received = request.headers.get(
             "X-Telegram-Bot-Api-Secret-Token"
