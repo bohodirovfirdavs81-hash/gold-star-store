@@ -1,3 +1,4 @@
+
 import os
 import telebot
 from flask import Flask, request, abort
@@ -28,23 +29,29 @@ def start(message):
             "/premium - Telegram Premium"
         )
 
-     print("START RECEIVED:", message.text)
+    print("START RECEIVED:", message.text)
 
-try:
-    bot.send_message(message.chat.id, text)
-    print("MESSAGE SENT")
-except Exception as e:
-    print("SEND ERROR:", repr(e))
+    try:
+        bot.send_message(message.chat.id, text)
+        print("MESSAGE SENT")
+    except Exception as e:
+        print("SEND ERROR:", repr(e))
 
 
 @bot.message_handler(commands=["stars"])
 def stars(message):
-    bot.send_message(message.chat.id, "⭐ Раздел Telegram Stars")
+    bot.send_message(
+        message.chat.id,
+        "⭐ Раздел Telegram Stars"
+    )
 
 
 @bot.message_handler(commands=["premium"])
 def premium(message):
-    bot.send_message(message.chat.id, "💎 Раздел Telegram Premium")
+    bot.send_message(
+        message.chat.id,
+        "💎 Раздел Telegram Premium"
+    )
 
 
 @app.route("/", methods=["GET"])
@@ -64,16 +71,19 @@ def webhook():
     update = telebot.types.Update.de_json(
         request.get_data().decode("utf-8")
     )
+
     bot.process_new_updates([update])
     return "OK", 200
 
 
 if RENDER_URL:
     bot.remove_webhook()
+
     result = bot.set_webhook(
         url=RENDER_URL + "/telegram-webhook",
         secret_token=WEBHOOK_SECRET
     )
+
     print("WEBHOOK SET:", result)
     print("WEBHOOK INFO:", bot.get_webhook_info())
 
