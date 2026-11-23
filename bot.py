@@ -4,7 +4,7 @@ from flask import Flask, request, abort
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
+RENDER_URL = "https://gold-star-store-bot.onrender.com"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не настроен")
