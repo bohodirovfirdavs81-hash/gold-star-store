@@ -34,7 +34,7 @@ def start(message):
     try:
         bot.send_message(message.chat.id, text)
         print("MESSAGE SENT")
-    except Exception as e:
+    except Exception 
         print("SEND ERROR:", repr(e))
 
 
@@ -96,5 +96,5 @@ if RENDER_URL:
 
 if __name__ == "__main__":
     app.run(
-        host="0.0.0.0",
+        host="0.0.0.
         port=int(os.getenv("PORT", 
