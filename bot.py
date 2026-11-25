@@ -70,9 +70,10 @@ def webhook():
         update = telebot.types.Update.de_json(raw_data)
 
         if update.message:
-            print("MESSAGE TEXT:", update.message.text)
-        else:
-            print("NO MESSAGE IN UPDATE")
+    print("MESSAGE TEXT:", update.message.text)
+    print("MESSAGE ENTITIES:", update.message.entities)
+else:
+    print("NO MESSAGE IN UPDATE")
 
         bot.process_new_updates([update])
         print("UPDATE PROCESSED")
