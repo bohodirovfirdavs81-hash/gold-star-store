@@ -67,6 +67,8 @@ def webhook():
         print("RAW UPDATE RECEIVED")
 
         update = telebot.types.Update.de_json(raw_data)
+        print("UPDATE DATA:", update)
+print("MESSAGE:", update.message)
         print("UPDATE PARSED")
 
         bot.process_new_updates([update])
