@@ -35,6 +35,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 RENDER_URL = os.environ.get("RENDER_URL", "").strip().rstrip("/")
 DB_PATH = os.environ.get("DB_PATH", "goldstar.db").strip()
 SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "").strip().lstrip("@")
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://gold-star-store.onrender.com").strip()
 
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "0").strip() or 0)
@@ -58,6 +59,7 @@ MENU_MY = "📦 Мои покупки"
 MENU_CATALOG = "🛒 Каталог товаров"
 MENU_SUPPORT = "📞 Поддержка"
 MENU_INFO = "ℹ️ Информация"
+MENU_WEBAPP = "🌐 Открыть магазин"
 
 CATS = {
     "stars": "⭐ Telegram Stars",
@@ -300,6 +302,8 @@ def get_order(oid):
 # --------------------------------------------------------------------------
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    if WEBAPP_URL.startswith("https://"):
+        kb.row(types.KeyboardButton(MENU_WEBAPP, web_app=types.WebAppInfo(url=WEBAPP_URL)))
     kb.add(
         types.KeyboardButton(MENU_STARS),
         types.KeyboardButton(MENU_PREMIUM),
@@ -1155,10 +1159,22 @@ def _setup_webhook():
                 allowed_updates=["message", "callback_query", "pre_checkout_query"],
             )
             log.info("Webhook установлен: %s/webhook", RENDER_URL)
-            return
+            break
         except Exception:
             log.exception("Не удалось установить webhook (попытка %s)", attempt + 1)
             time.sleep(3 * (attempt + 1))
+    else:
+        return
+    if WEBAPP_URL.startswith("https://"):
+        try:
+            bot.set_chat_menu_button(
+                menu_button=types.MenuButtonWebApp(
+                    text="🛍 Магазин", web_app=types.WebAppInfo(url=WEBAPP_URL)
+                )
+            )
+            log.info("Кнопка Mini App установлена: %s", WEBAPP_URL)
+        except Exception:
+            log.exception("Не удалось установить кнопку меню Mini App")
 
 
 init_db()
