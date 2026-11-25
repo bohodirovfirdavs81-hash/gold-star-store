@@ -1,4 +1,4 @@
-
+1
 import os
 import telebot
 from flask import Flask, request, abort
@@ -98,3 +98,5 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.
         port=int(os.getenv("PORT", 
+ипс
+н
