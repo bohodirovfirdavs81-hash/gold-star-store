@@ -61,19 +61,22 @@ def home():
 @app.route("/telegram-webhook", methods=["POST"])
 def webhook():
     print("WEBHOOK RECEIVED")
-    if WEBHOOK_SECRET:
-        received = request.headers.get(
-            "X-Telegram-Bot-Api-Secret-Token"
-        )
-        if received != WEBHOOK_SECRET:
-            abort(403)
 
-    update = telebot.types.Update.de_json(
-        request.get_data().decode("utf-8")
-    )
+    try:
+        raw_data = request.get_data().decode("utf-8")
+        print("RAW UPDATE RECEIVED")
 
-    bot.process_new_updates([update])
-    return "OK", 200
+        update = telebot.types.Update.de_json(raw_data)
+        print("UPDATE PARSED")
+
+        bot.process_new_updates([update])
+        print("UPDATE PROCESSED")
+
+        return "OK", 200
+
+    except Exception as e:
+        print("WEBHOOK ERROR:", repr(e))
+        return "ERROR", 500
 
 
 if RENDER_URL:
