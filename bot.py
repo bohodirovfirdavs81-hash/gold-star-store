@@ -1,3 +1,4 @@
+
 import os
 import telebot
 from flask import Flask, request, abort
@@ -39,41 +40,42 @@ def start(message):
 
 @bot.message_handler(commands=["stars"])
 def stars(message):
-    bot.send_message(
-        message.chat.id,
-        "⭐ Раздел Telegram Stars"
-    )
+    bot.send_message(message.chat.id, "⭐ Раздел Telegram Stars")
 
 
 @bot.message_handler(commands=["premium"])
 def premium(message):
-    bot.send_message(
-        message.chat.id,
-        "💎 Раздел Telegram Premium"
-    )
+    bot.send_message(message.chat.id, "💎 Раздел Telegram Premium")
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Gold Star Bot is running!"
+    return "Gold Star Bot is running!", 200
 
 
 @app.route("/telegram-webhook", methods=["POST"])
 def webhook():
     print("WEBHOOK RECEIVED")
 
+    if WEBHOOK_SECRET:
+        received = request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token"
+        )
+        if received != WEBHOOK_SECRET:
+            print("SECRET MISMATCH")
+            abort(403)
+
     try:
         raw_data = request.get_data().decode("utf-8")
-        print("RAW UPDATE RECEIVED")
-
         update = telebot.types.Update.de_json(raw_data)
-        print("UPDATE DATA:", update)
-print("MESSAGE:", update.message)
-        print("UPDATE PARSED")
+
+        if update.message:
+            print("MESSAGE TEXT:", update.message.text)
+        else:
+            print("NO MESSAGE IN UPDATE")
 
         bot.process_new_updates([update])
         print("UPDATE PROCESSED")
-
         return "OK", 200
 
     except Exception as e:
@@ -83,12 +85,10 @@ print("MESSAGE:", update.message)
 
 if RENDER_URL:
     bot.remove_webhook()
-
     result = bot.set_webhook(
         url=RENDER_URL + "/telegram-webhook",
         secret_token=WEBHOOK_SECRET
     )
-
     print("WEBHOOK SET:", result)
     print("WEBHOOK INFO:", bot.get_webhook_info())
 
