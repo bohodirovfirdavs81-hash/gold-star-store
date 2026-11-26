@@ -57,7 +57,12 @@ if not BOT_TOKEN:
 if not WEBHOOK_SECRET:
     raise RuntimeError("Не задана переменная окружения WEBHOOK_SECRET")
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False, parse_mode="HTML")
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    threaded=True,
+    num_threads=4,
+    parse_mode="HTML"
+)
 app = Flask(__name__)
 
 # --------------------------------------------------------------------------
