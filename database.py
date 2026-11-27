@@ -1,690 +1,590 @@
-# -*- coding: utf-8 -*-
-"""
-Gold Star Store — база данных.
-
-SQLite, WAL, безопасные транзакции, миграции.
-Не удаляет существующие данные.
-Не обнуляет кошельки.
-Не добавляет демонстрационные товары.
-"""
-
+import contextlib
+import json
 import os
 import sqlite3
 import threading
 import time
-import json
-from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Any
 
 import config
 
-
 _LOCAL = threading.local()
 
 
-def _database_path() -> str:
-    path = getattr(config, "DATABASE_PATH", None)
-    if not path:
-        path = os.getenv("DATABASE_PATH", "gold_star.db")
-    return os.path.abspath(path)
-
-
 def _connect() -> sqlite3.Connection:
-    path = _database_path()
-    parent = os.path.dirname(path)
-
+    db_path = config.DATABASE_PATH
+    parent = os.path.dirname(os.path.abspath(db_path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-
-    conn = sqlite3.connect(
-        path,
-        timeout=30,
-        isolation_level=None,
-        check_same_thread=False,
-    )
-
+    conn = sqlite3.connect(db_path, timeout=30.0, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = getattr(_LOCAL, "connection", None)
-
+def get_conn() -> sqlite3.Connection:
+    conn = getattr(_LOCAL, "conn", None)
     if conn is None:
         conn = _connect()
-        _LOCAL.connection = conn
-        _LOCAL.transaction_depth = 0
-
+        _LOCAL.conn = conn
     return conn
 
 
-def close_connection() -> None:
-    conn = getattr(_LOCAL, "connection", None)
-
-    if conn is not None:
-        try:
-            conn.close()
-        finally:
-            _LOCAL.connection = None
-            _LOCAL.transaction_depth = 0
-
-
-@contextmanager
-def transaction(immediate: bool = True):
-    """
-    Транзакция с поддержкой вложенных вызовов.
-    """
-
-    conn = get_connection()
-    depth = getattr(_LOCAL, "transaction_depth", 0)
-
-    savepoint = f"sp_{depth}"
-
-    try:
-        if depth == 0:
-            conn.execute(
-                "BEGIN IMMEDIATE" if immediate else "BEGIN"
-            )
-        else:
-            conn.execute(f"SAVEPOINT {savepoint}")
-
-        _LOCAL.transaction_depth = depth + 1
-
+@contextlib.contextmanager
+def tx():
+    conn = get_conn()
+    if conn.in_transaction:
         yield conn
-
-        if depth == 0:
-            conn.commit()
-        else:
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.execute("COMMIT")
     except Exception:
-        if depth == 0:
-            conn.rollback()
-        else:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        with contextlib.suppress(sqlite3.Error):
+            conn.execute("ROLLBACK")
         raise
 
-    finally:
-        _LOCAL.transaction_depth = depth
+
+def q_one(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+    row = get_conn().execute(sql, params).fetchone()
+    return dict(row) if row else None
 
 
-def execute(sql: str, params: tuple = ()) -> sqlite3.Cursor:
-    return get_connection().execute(sql, params)
+def q_all(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    rows = get_conn().execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
 
 
-def executemany(sql: str, params: list) -> sqlite3.Cursor:
-    return get_connection().executemany(sql, params)
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return bool(row)
 
 
-def fetchone(sql: str, params: tuple = ()):
-    return execute(sql, params).fetchone()
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not _table_exists(conn, table):
+        return set()
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r["name"] for r in rows}
 
 
-def fetchall(sql: str, params: tuple = ()):
-    return execute(sql, params).fetchall()
-
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _columns(table: str) -> set[str]:
-    rows = fetchall(f"PRAGMA table_info({table})")
-    return {row["name"] for row in rows}
-
-
-def _add_column(table: str, name: str, definition: str) -> None:
-    if name not in _columns(table):
-        execute(
-            f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+def _seed_catalog_if_empty(conn: sqlite3.Connection) -> None:
+    cat_count = conn.execute("SELECT COUNT(*) AS c FROM categories").fetchone()["c"]
+    if int(cat_count) == 0:
+        conn.executemany(
+            "INSERT INTO categories (slug, title, description, sort_order, is_active) VALUES (?, ?, ?, ?, 1)",
+            [
+                ("stars", "Telegram Stars", "Звёзды Telegram на указанный аккаунт", 1),
+                ("premium", "Telegram Premium", "Подписка Telegram Premium", 2),
+                ("gifts", "Telegram Gifts", "Подарки Telegram", 3),
+            ],
         )
+
+    prod_count = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
+    if int(prod_count) == 0:
+        cats = {
+            r["slug"]: r["id"]
+            for r in conn.execute("SELECT id, slug FROM categories").fetchall()
+        }
+        seed_items = [
+            (cats.get("stars"), "STAR-100", "100 Telegram Stars", "100 звёзд на @username", 25000, "auto", 1),
+            (cats.get("stars"), "STAR-500", "500 Telegram Stars", "500 звёзд на @username", 120000, "auto", 2),
+            (cats.get("premium"), "PREM-3M", "Telegram Premium 3 мес.", "Подписка на 3 месяца", 185000, "manual", 3),
+            (cats.get("premium"), "PREM-12M", "Telegram Premium 12 мес.", "Подписка на 12 месяцев", 640000, "manual", 4),
+            (cats.get("gifts"), "GIFT-ROSE", "Подарок «Золотая роза»", "Подарок в Telegram", 45000, "manual", 5),
+            (cats.get("gifts"), "GIFT-STARBOX", "Подарок «Звёздный бокс»", "Подарок в Telegram", 95000, "manual", 6),
+        ]
+        valid_items = [(c, sku, title, desc, price, mode) for c, sku, title, desc, price, mode, _ in seed_items if c is not None]
+        conn.executemany(
+            """
+            INSERT INTO products (category_id, sku, title, description, price_uzs, fulfillment_mode, is_active, sort_order)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            [(c, sku, title, desc, price, mode, idx) for idx, (c, sku, title, desc, price, mode) in enumerate(valid_items, 1)],
+        )
+
+
+def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
+    # Сохраняем старую таблицу orders в legacy_orders, если она существовала со старой схемой
+    if _table_exists(conn, "orders"):
+        cols = _table_columns(conn, "orders")
+        if "total_amount" in cols and "recipient" in cols:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO legacy_orders (id, user_id, recipient, total_amount, currency, status, created_at, updated_at)
+                SELECT id, user_id, recipient, total_amount, COALESCE(currency, 'XTR'), status, created_at, updated_at
+                FROM orders
+                """
+            )
+    if _table_exists(conn, "order_items"):
+        cols = _table_columns(conn, "order_items")
+        if {"order_id", "title", "price", "qty"}.issubset(cols):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO legacy_order_items (id, order_id, product_id, title, price, qty)
+                SELECT id, order_id, product_id, title, price, qty
+                FROM order_items
+                """
+            )
+
+    # Если products существовал со старым столбцом price вместо price_uzs
+    prod_cols = _table_columns(conn, "products")
+    if prod_cols and "price_uzs" not in prod_cols and "price" in prod_cols:
+        conn.execute("ALTER TABLE products ADD COLUMN price_uzs INTEGER NOT NULL DEFAULT 0")
+        conn.execute("UPDATE products SET price_uzs = COALESCE(price, 0)")
+    if prod_cols and "fulfillment_mode" not in prod_cols:
+        conn.execute("ALTER TABLE products ADD COLUMN fulfillment_mode TEXT NOT NULL DEFAULT 'auto'")
+    if prod_cols and "sku" not in prod_cols:
+        conn.execute("ALTER TABLE products ADD COLUMN sku TEXT")
+        conn.execute("UPDATE products SET sku = 'SKU-' || id WHERE sku IS NULL OR sku = ''")
+
+
+def _run_one_time_wallet_reset(conn: sqlite3.Connection) -> None:
+    """Обнуляет балансы и бонусные балансы существующих пользователей строго один раз."""
+    flag = conn.execute(
+        "SELECT value FROM schema_state WHERE key = 'wallet_balances_reset_v1'"
+    ).fetchone()
+    if flag:
+        return
+
+    now = int(time.time())
+    existing_users = conn.execute("SELECT telegram_id FROM users").fetchall()
+    for u in existing_users:
+        uid = int(u["telegram_id"])
+        conn.execute(
+            """
+            INSERT INTO wallets (user_id, balance_uzs, bonus_uzs, updated_at)
+            VALUES (?, 0, 0, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                balance_uzs = 0,
+                bonus_uzs = 0,
+                updated_at = excluded.updated_at
+            """,
+            (uid, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO wallet_transactions
+                (user_id, kind, amount_uzs, bonus_delta_uzs, balance_after_uzs, bonus_after_uzs, ref_type, ref_id, note, created_at)
+            VALUES (?, 'reset', 0, 0, 0, 0, 'system', 'wallet_init_v1', 'Однократный сброс баланса при запуске системы кошельков', ?)
+            """,
+            (uid, now),
+        )
+
+    conn.execute(
+        """
+        INSERT INTO schema_state (key, value, updated_at)
+        VALUES ('wallet_balances_reset_v1', 'done', ?)
+        ON CONFLICT(key) DO UPDATE SET value = 'done', updated_at = excluded.updated_at
+        """,
+        (now,),
+    )
 
 
 def init_db() -> None:
-    """
-    Создаёт отсутствующие таблицы и выполняет
-    безопасные добавочные миграции.
-    """
-
-    schema = """
-    CREATE TABLE IF NOT EXISTS schema_state (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS users (
-        telegram_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        language_code TEXT,
-        is_premium INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS categories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        slug TEXT NOT NULL UNIQUE,
-        title TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        sort_order INTEGER NOT NULL DEFAULT 0,
-        active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        category_id INTEGER,
-        sku TEXT UNIQUE,
-        title TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        price_uzs INTEGER NOT NULL DEFAULT 0,
-        price_xtr INTEGER NOT NULL DEFAULT 0,
-        fulfillment_mode TEXT NOT NULL DEFAULT 'manual',
-        active INTEGER NOT NULL DEFAULT 1,
-        bonus_eligible INTEGER NOT NULL DEFAULT 1,
-        stock INTEGER,
-        image_url TEXT,
-        sort_order INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(category_id) REFERENCES categories(id)
-            ON DELETE SET NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS cart_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
-        qty INTEGER NOT NULL DEFAULT 1,
-        recipient TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(user_id, product_id),
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE CASCADE,
-        FOREIGN KEY(product_id) REFERENCES products(id)
-            ON DELETE RESTRICT
-    );
-
-    CREATE TABLE IF NOT EXISTS wallets (
-        user_id INTEGER PRIMARY KEY,
-        balance_uzs INTEGER NOT NULL DEFAULT 0,
-        bonus_uzs INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE CASCADE,
-        CHECK(balance_uzs >= 0),
-        CHECK(bonus_uzs >= 0)
-    );
-
-    CREATE TABLE IF NOT EXISTS wallet_transactions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        transaction_type TEXT NOT NULL,
-        amount_uzs INTEGER NOT NULL,
-        balance_delta INTEGER NOT NULL DEFAULT 0,
-        bonus_delta INTEGER NOT NULL DEFAULT 0,
-        balance_after INTEGER NOT NULL DEFAULT 0,
-        bonus_after INTEGER NOT NULL DEFAULT 0,
-        reference_type TEXT,
-        reference_id TEXT,
-        description TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE RESTRICT
-    );
-
-    CREATE TABLE IF NOT EXISTS topups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount_uzs INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        receipt_file_id TEXT,
-        receipt_note TEXT NOT NULL DEFAULT '',
-        admin_id INTEGER,
-        admin_comment TEXT NOT NULL DEFAULT '',
-        payment_reference TEXT,
-        idempotency_key TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        confirmed_at TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE RESTRICT
-    );
-
-    CREATE TABLE IF NOT EXISTS wallet_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
-        product_title TEXT NOT NULL,
-        qty INTEGER NOT NULL DEFAULT 1,
-        recipient TEXT NOT NULL DEFAULT '',
-        unit_price_uzs INTEGER NOT NULL,
-        total_price_uzs INTEGER NOT NULL,
-        bonus_used_uzs INTEGER NOT NULL DEFAULT 0,
-        balance_used_uzs INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'pending',
-        idempotency_key TEXT,
-        admin_comment TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE RESTRICT,
-        FOREIGN KEY(product_id) REFERENCES products(id)
-            ON DELETE RESTRICT
-    );
-
-    CREATE TABLE IF NOT EXISTS legacy_orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        total_uzs INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE RESTRICT
-    );
-
-    CREATE TABLE IF NOT EXISTS legacy_order_items (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id INTEGER NOT NULL,
-        product_id INTEGER,
-        product_title TEXT NOT NULL,
-        qty INTEGER NOT NULL DEFAULT 1,
-        unit_price_uzs INTEGER NOT NULL DEFAULT 0,
-        FOREIGN KEY(order_id) REFERENCES legacy_orders(id)
-            ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        order_id INTEGER,
-        payment_type TEXT NOT NULL,
-        provider TEXT NOT NULL,
-        amount INTEGER NOT NULL,
-        currency TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        provider_payment_id TEXT,
-        telegram_charge_id TEXT UNIQUE,
-        payload TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            ON DELETE RESTRICT
-    );
-
-    CREATE TABLE IF NOT EXISTS admin_audit_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        admin_id INTEGER NOT NULL,
-        action TEXT NOT NULL,
-        target_type TEXT,
-        target_id TEXT,
-        details TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS rate_limit_events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_key TEXT NOT NULL,
-        created_at REAL NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS used_init_nonces (
-        nonce TEXT PRIMARY KEY,
-        user_id INTEGER,
-        created_at REAL NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS fsm_states (
-        user_id INTEGER PRIMARY KEY,
-        state TEXT NOT NULL,
-        data TEXT NOT NULL DEFAULT '{}',
-        updated_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS inbox_updates (
-        update_id INTEGER PRIMARY KEY,
-        status TEXT NOT NULL DEFAULT 'received',
-        received_at TEXT NOT NULL,
-        processed_at TEXT,
-        error TEXT
-    );
-    """
-
-    with transaction():
-        conn = get_connection()
-        conn.executescript(schema)
-
-        # Добавочные миграции для ранее созданных таблиц.
-        migrations = {
-            "users": [
-                ("username", "TEXT"),
-                ("first_name", "TEXT"),
-                ("last_name", "TEXT"),
-                ("language_code", "TEXT"),
-                ("is_premium", "INTEGER NOT NULL DEFAULT 0"),
-                ("created_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ],
-            "products": [
-                ("category_id", "INTEGER"),
-                ("sku", "TEXT"),
-                ("description", "TEXT NOT NULL DEFAULT ''"),
-                ("price_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("price_xtr", "INTEGER NOT NULL DEFAULT 0"),
-                ("fulfillment_mode", "TEXT NOT NULL DEFAULT 'manual'"),
-                ("active", "INTEGER NOT NULL DEFAULT 1"),
-                ("bonus_eligible", "INTEGER NOT NULL DEFAULT 1"),
-                ("stock", "INTEGER"),
-                ("image_url", "TEXT"),
-                ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
-                ("created_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ],
-            "wallets": [
-                ("balance_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("bonus_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("updated_at", "TEXT"),
-            ],
-            "topups": [
-                ("receipt_file_id", "TEXT"),
-                ("receipt_note", "TEXT NOT NULL DEFAULT ''"),
-                ("admin_id", "INTEGER"),
-                ("admin_comment", "TEXT NOT NULL DEFAULT ''"),
-                ("payment_reference", "TEXT"),
-                ("idempotency_key", "TEXT"),
-                ("confirmed_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ],
-            "wallet_orders": [
-                ("qty", "INTEGER NOT NULL DEFAULT 1"),
-                ("recipient", "TEXT NOT NULL DEFAULT ''"),
-                ("unit_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("total_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("bonus_used_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("balance_used_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("idempotency_key", "TEXT"),
-                ("admin_comment", "TEXT NOT NULL DEFAULT ''"),
-                ("updated_at", "TEXT"),
-            ],
-        }
-
-        for table, columns in migrations.items():
-            for name, definition in columns:
-                _add_column(table, name, definition)
-
-        indexes = [
+    with tx() as conn:
+        conn.executescript(
             """
-            CREATE INDEX IF NOT EXISTS idx_products_category
-            ON products(category_id, active, sort_order)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_orders_user
-            ON wallet_orders(user_id, created_at)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_orders_status
-            ON wallet_orders(status, created_at)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_topups_user
-            ON topups(user_id, created_at)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_topups_status
-            ON topups(status, created_at)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_transactions_user
-            ON wallet_transactions(user_id, created_at)
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_rate_limit_key
-            ON rate_limit_events(event_key, created_at)
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_topups_idempotency
-            ON topups(user_id, idempotency_key)
-            WHERE idempotency_key IS NOT NULL
-            """,
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_orders_idempotency
-            ON wallet_orders(user_id, idempotency_key)
-            WHERE idempotency_key IS NOT NULL
-            """,
-        ]
+            CREATE TABLE IF NOT EXISTS schema_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
 
-        for sql in indexes:
-            conn.execute(sql)
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
-        conn.execute(
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_blocked INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER NOT NULL REFERENCES categories(id),
+                sku TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                price_uzs INTEGER NOT NULL CHECK(price_uzs >= 0),
+                fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS cart_items (
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                qty INTEGER NOT NULL CHECK(qty > 0),
+                PRIMARY KEY (user_id, product_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS legacy_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                recipient TEXT NOT NULL,
+                total_amount INTEGER NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'XTR',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS legacy_order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL REFERENCES legacy_orders(id),
+                product_id INTEGER,
+                title TEXT NOT NULL,
+                price INTEGER NOT NULL,
+                qty INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                payload TEXT,
+                telegram_charge_id TEXT UNIQUE,
+                provider_charge_id TEXT,
+                status TEXT NOT NULL DEFAULT 'paid',
+                problem TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wallets (
+                user_id INTEGER PRIMARY KEY,
+                balance_uzs INTEGER NOT NULL DEFAULT 0 CHECK(balance_uzs >= 0),
+                bonus_uzs INTEGER NOT NULL DEFAULT 0 CHECK(bonus_uzs >= 0),
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                amount_uzs INTEGER NOT NULL DEFAULT 0,
+                bonus_delta_uzs INTEGER NOT NULL DEFAULT 0,
+                balance_after_uzs INTEGER NOT NULL DEFAULT 0,
+                bonus_after_uzs INTEGER NOT NULL DEFAULT 0,
+                ref_type TEXT,
+                ref_id TEXT,
+                note TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS topups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount_uzs INTEGER NOT NULL CHECK(amount_uzs > 0),
+                requisites TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                receipt_file_id TEXT,
+                receipt_caption TEXT,
+                admin_id INTEGER,
+                admin_comment TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                decided_at INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS wallet_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_uid TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL REFERENCES products(id),
+                sku TEXT NOT NULL,
+                product_title TEXT NOT NULL,
+                category_slug TEXT NOT NULL,
+                fulfillment_mode TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                qty INTEGER NOT NULL CHECK(qty > 0),
+                unit_price_uzs INTEGER NOT NULL CHECK(unit_price_uzs >= 0),
+                total_uzs INTEGER NOT NULL CHECK(total_uzs >= 0),
+                paid_from_balance_uzs INTEGER NOT NULL DEFAULT 0,
+                paid_from_bonus_uzs INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'paid',
+                refunded INTEGER NOT NULL DEFAULT 0,
+                admin_id INTEGER,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                details TEXT,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rate_limit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucket_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_rl_bucket_time ON rate_limit_events(bucket_key, created_at);
+
+            CREATE TABLE IF NOT EXISTS used_init_nonces (
+                nonce_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fsm_states (
+                user_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS inbox_updates (
+                update_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            );
             """
-            INSERT INTO schema_state(key, value, updated_at)
-            VALUES('database_version', '2', ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (now(),),
         )
 
+        _migrate_legacy_tables(conn)
 
-def upsert_user(tg_user: dict[str, Any]) -> None:
-    """
-    Сохраняет пользователя Telegram WebApp.
-    Принимает словарь user из проверенного initData.
-    """
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', 'GoldStar_uz_bot')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('support_text', 'Напишите нам по вопросам заказов и пополнений баланса.')"
+        )
 
-    if not isinstance(tg_user, dict):
-        raise ValueError("Некорректные данные пользователя")
+        _seed_catalog_if_empty(conn)
+        _run_one_time_wallet_reset(conn)
 
-    user_id = int(tg_user.get("id") or 0)
 
-    if user_id <= 0:
-        raise ValueError("Некорректный Telegram ID")
+def ensure_wallet(conn: sqlite3.Connection, user_id: int) -> dict[str, int]:
+    uid = int(user_id)
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO wallets (user_id, balance_uzs, bonus_uzs, updated_at)
+        VALUES (?, 0, 0, ?)
+        """,
+        (uid, now),
+    )
+    row = conn.execute(
+        "SELECT balance_uzs, bonus_uzs FROM wallets WHERE user_id = ?",
+        (uid,),
+    ).fetchone()
+    return {"balance_uzs": int(row["balance_uzs"]), "bonus_uzs": int(row["bonus_uzs"])}
 
-    timestamp = now()
 
-    with transaction():
-        execute(
+def upsert_user(tg_user: Any) -> None:
+    if not tg_user:
+        return
+    uid = int(tg_user.id)
+    now = int(time.time())
+    with tx() as conn:
+        conn.execute(
             """
-            INSERT INTO users(
-                telegram_id, username, first_name, last_name,
-                language_code, is_premium, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (telegram_id, username, first_name, last_name, language_code, is_blocked, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
                 username = excluded.username,
                 first_name = excluded.first_name,
                 last_name = excluded.last_name,
-                language_code = excluded.language_code,
-                is_premium = excluded.is_premium,
+                language_code = COALESCE(excluded.language_code, users.language_code),
                 updated_at = excluded.updated_at
             """,
             (
-                user_id,
-                tg_user.get("username"),
-                tg_user.get("first_name"),
-                tg_user.get("last_name"),
-                tg_user.get("language_code"),
-                int(bool(tg_user.get("is_premium"))),
-                timestamp,
-                timestamp,
+                uid,
+                getattr(tg_user, "username", None),
+                getattr(tg_user, "first_name", None),
+                getattr(tg_user, "last_name", None),
+                getattr(tg_user, "language_code", None),
+                now,
+                now,
             ),
         )
+        ensure_wallet(conn, uid)
 
-        execute(
-            """
-            INSERT OR IGNORE INTO wallets(
-                user_id, balance_uzs, bonus_uzs, updated_at
-            )
-            VALUES (?, 0, 0, ?)
-            """,
-            (user_id, timestamp),
+
+def check_and_record_rate_limit(bucket_key: str, limit: int, window_sec: int) -> bool:
+    now = int(time.time())
+    cutoff = now - int(window_sec)
+    with tx() as conn:
+        conn.execute(
+            "DELETE FROM rate_limit_events WHERE bucket_key = ? AND created_at < ?",
+            (bucket_key, cutoff),
         )
-
-
-def get_user(user_id: int):
-    return fetchone(
-        "SELECT * FROM users WHERE telegram_id = ?",
-        (int(user_id),),
-    )
-
-
-def get_wallet(user_id: int):
-    return fetchone(
-        "SELECT * FROM wallets WHERE user_id = ?",
-        (int(user_id),),
-    )
-
-
-def check_and_record_rate_limit(
-    key: str,
-    limit: int,
-    window_sec: int,
-) -> bool:
-    """
-    True — запрос разрешён.
-    False — превышен лимит.
-    """
-
-    if not key or limit <= 0 or window_sec <= 0:
-        return False
-
-    current = time.time()
-    cutoff = current - int(window_sec)
-
-    with transaction():
-        execute(
-            "DELETE FROM rate_limit_events WHERE created_at < ?",
-            (current - 86400,),
-        )
-
-        row = fetchone(
-            """
-            SELECT COUNT(*) AS total
-            FROM rate_limit_events
-            WHERE event_key = ? AND created_at >= ?
-            """,
-            (key, cutoff),
-        )
-
-        if int(row["total"]) >= int(limit):
+        cnt = conn.execute(
+            "SELECT COUNT(*) AS c FROM rate_limit_events WHERE bucket_key = ? AND created_at >= ?",
+            (bucket_key, cutoff),
+        ).fetchone()["c"]
+        if int(cnt) >= int(limit):
             return False
-
-        execute(
-            """
-            INSERT INTO rate_limit_events(event_key, created_at)
-            VALUES (?, ?)
-            """,
-            (key, current),
+        conn.execute(
+            "INSERT INTO rate_limit_events (bucket_key, created_at) VALUES (?, ?)",
+            (bucket_key, now),
         )
-
-    return True
-
-
-def mark_init_nonce_used(nonce: str, user_id: int | None = None) -> bool:
-    """
-    Защита от повторного использования nonce.
-    True — nonce записан впервые.
-    False — nonce уже использовался.
-    """
-
-    if not nonce:
-        return False
-
-    try:
-        with transaction():
-            execute(
-                """
-                INSERT INTO used_init_nonces(nonce, user_id, created_at)
-                VALUES (?, ?, ?)
-                """,
-                (nonce, user_id, time.time()),
-            )
         return True
-    except sqlite3.IntegrityError:
-        return False
 
 
-def get_setting(key: str, default: str | None = None):
-    row = fetchone(
-        "SELECT value FROM settings WHERE key = ?",
-        (key,),
-    )
+def consume_init_nonce_once(nonce_hash: str, user_id: int, ttl_sec: int = 120) -> bool:
+    now = int(time.time())
+    cutoff = now - int(ttl_sec)
+    with tx() as conn:
+        conn.execute("DELETE FROM used_init_nonces WHERE created_at < ?", (cutoff,))
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO used_init_nonces (nonce_hash, user_id, created_at) VALUES (?, ?, ?)",
+            (nonce_hash, int(user_id), now),
+        )
+        return cur.rowcount > 0
+
+
+def get_setting(key: str, default: str = "") -> str:
+    row = q_one("SELECT value FROM settings WHERE key = ?", (key,))
     return row["value"] if row else default
 
 
-def set_setting(key: str, value: Any) -> None:
-    with transaction():
-        execute(
+def set_setting(key: str, value: str) -> None:
+    with tx() as conn:
+        conn.execute(
             """
-            INSERT INTO settings(key, value, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+
+
+def fsm_set(user_id: int, state: str, data: dict[str, Any] | None = None) -> None:
+    now = int(time.time())
+    payload = json.dumps(data or {}, ensure_ascii=False)
+    with tx() as conn:
+        ensure_wallet(conn, int(user_id))
+        conn.execute(
+            """
+            INSERT INTO fsm_states (user_id, state, data_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                state = excluded.state,
+                data_json = excluded.data_json,
                 updated_at = excluded.updated_at
             """,
-            (key, str(value), now()),
+            (int(user_id), state, payload, now),
         )
 
 
-def record_admin_action(
-    admin_id: int,
-    action: str,
-    target_type: str | None = None,
-    target_id: str | None = None,
-    details: Any = "",
-) -> None:
-    if not isinstance(details, str):
-        details = json.dumps(
-            details,
-            ensure_ascii=False,
-            default=str,
-        )
+def fsm_get(user_id: int) -> dict[str, Any] | None:
+    row = q_one("SELECT state, data_json, updated_at FROM fsm_states WHERE user_id = ?", (int(user_id),))
+    if not row:
+        return None
+    try:
+        data = json.loads(row["data_json"] or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    return {"state": row["state"], "data": data, "updated_at": int(row["updated_at"])}
 
-    with transaction():
-        execute(
+
+def fsm_clear(user_id: int) -> None:
+    with tx() as conn:
+        conn.execute("DELETE FROM fsm_states WHERE user_id = ?", (int(user_id),))
+
+
+def inbox_add(update_id: int, raw_payload: str) -> bool:
+    now = int(time.time())
+    with tx() as conn:
+        cur = conn.execute(
             """
-            INSERT INTO admin_audit_log(
-                admin_id, action, target_type, target_id,
-                details, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO inbox_updates (update_id, payload, status, attempts, updated_at)
+            VALUES (?, ?, 'pending', 0, ?)
             """,
-            (
-                int(admin_id),
-                str(action),
-                target_type,
-                target_id,
-                details,
-                now(),
-            ),
+            (int(update_id), raw_payload, now),
+        )
+        return cur.rowcount > 0
+
+
+def inbox_claim(update_id: int) -> dict[str, Any] | None:
+    now = int(time.time())
+    with tx() as conn:
+        row = conn.execute(
+            "SELECT update_id, payload, status, attempts FROM inbox_updates WHERE update_id = ?",
+            (int(update_id),),
+        ).fetchone()
+        if not row or row["status"] == "done":
+            return None
+        conn.execute(
+            """
+            UPDATE inbox_updates
+            SET status = 'processing', attempts = attempts + 1, updated_at = ?
+            WHERE update_id = ?
+            """,
+            (now, int(update_id)),
+        )
+        return {"update_id": int(row["update_id"]), "payload": row["payload"]}
+
+
+def inbox_done(update_id: int) -> None:
+    now = int(time.time())
+    with tx() as conn:
+        conn.execute(
+            "UPDATE inbox_updates SET status = 'done', error = NULL, updated_at = ? WHERE update_id = ?",
+            (now, int(update_id)),
         )
 
 
-# Совместимость с вариантами названий,
-# используемыми в других модулях проекта.
-db = get_connection
-query_one = fetchone
-query_all = fetchall
-q_one = fetchone
-q_all = fetchall
-q_exec = execute
+def inbox_fail(update_id: int, err: str) -> None:
+    now = int(time.time())
+    with tx() as conn:
+        conn.execute(
+            "UPDATE inbox_updates SET status = 'failed', error = ?, updated_at = ? WHERE update_id = ?",
+            (err[:1000], now, int(update_id)),
+        )
+
+
+def inbox_recover(startup: bool = False) -> list[int]:
+    cutoff = int(time.time()) - (5 if startup else 120)
+    rows = q_all(
+        """
+        SELECT update_id FROM inbox_updates
+        WHERE status IN ('pending', 'failed') OR (status = 'processing' AND updated_at <= ?)
+        ORDER BY update_id ASC
+        LIMIT 200
+        """,
+        (cutoff,),
+    )
+    return [int(r["update_id"]) for r in rows]
+
+
+def inbox_cleanup() -> None:
+    cutoff = int(time.time()) - 7 * 86400
+    with tx() as conn:
+        conn.execute("DELETE FROM inbox_updates WHERE status = 'done' AND updated_at < ?", (cutoff,))
