@@ -1,252 +1,511 @@
+# -*- coding: utf-8 -*-
+"""
+Gold Star Store — API для Telegram Mini App.
+
+Flask Blueprint:
+- проверка Telegram WebApp initData;
+- профиль и кошелёк;
+- каталог;
+- история заказов;
+- оформление заказов;
+- заявки на пополнение.
+"""
+
 import hashlib
 import hmac
 import json
+import logging
+import re
 import time
+
 from functools import wraps
-from typing import Any
 from urllib.parse import parse_qsl
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, jsonify, request, g
 
-import admin
 import config
 import database as db
-import payments
 import shop
+import payments
+
+
+logger = logging.getLogger(__name__)
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
 
-def verify_telegram_init_data(init_data: str, bot_token: str, max_age_sec: int) -> dict[str, Any] | None:
-    if not init_data or not bot_token:
-        return None
-    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
-    received_hash = pairs.pop("hash", "")
-    if not received_hash:
-        return None
+# --------------------------------------------------
+# ОТВЕТЫ API
+# --------------------------------------------------
+
+def success(data=None, message="OK", status=200):
+    return jsonify({
+        "ok": True,
+        "message": message,
+        "data": data,
+    }), status
+
+
+def error(message, status=400):
+    return jsonify({
+        "ok": False,
+        "error": str(message),
+    }), status
+
+
+# --------------------------------------------------
+# TELEGRAM INIT DATA
+# --------------------------------------------------
+
+def validate_init_data(init_data: str) -> dict:
+    """
+    Проверяет подпись Telegram WebApp initData.
+    Возвращает проверенные данные.
+    """
+
+    if not init_data or not isinstance(init_data, str):
+        raise ValueError("Отсутствуют данные Telegram")
+
+    if len(init_data) > 16384:
+        raise ValueError("Слишком большой initData")
 
     try:
-        auth_date = int(pairs.get("auth_date", "0"))
+        pairs = parse_qsl(
+            init_data,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
     except ValueError:
-        return None
-    now_ts = int(time.time())
-    if auth_date <= 0 or (now_ts - auth_date) > max_age_sec or auth_date > now_ts + 300:
-        return None
+        raise ValueError("Некорректный initData")
 
-    data_check_string = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs.keys()))
-    secret_key = hmac.new(b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256).digest()
-    computed_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    data = {}
 
-    if not hmac.compare_digest(computed_hash, received_hash):
-        return None
+    for key, value in pairs:
+        if key in data:
+            raise ValueError("Повторяющиеся параметры initData")
+        data[key] = value
 
-    raw_user = pairs.get("user")
-    if not raw_user:
-        return None
+    received_hash = data.pop("hash", None)
+
+    if not received_hash or not re.fullmatch(
+        r"[0-9a-fA-F]{64}",
+        received_hash,
+    ):
+        raise ValueError("Отсутствует подпись Telegram")
+
+    bot_token = getattr(config, "BOT_TOKEN", "")
+
+    if not bot_token:
+        raise ValueError("BOT_TOKEN не настроен")
+
+    data_check_string = "\n".join(
+        f"{key}={value}"
+        for key, value in sorted(data.items())
+    )
+
+    secret_key = hmac.new(
+        b"WebAppData",
+        bot_token.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(
+        calculated_hash,
+        received_hash.lower(),
+    ):
+        raise ValueError("Недействительная подпись Telegram")
+
     try:
-        user_obj = json.loads(raw_user)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(user_obj, dict) or "id" not in user_obj:
-        return None
-
-    try:
-        uid = int(user_obj["id"])
+        auth_date = int(data.get("auth_date", "0"))
     except (TypeError, ValueError):
-        return None
-    if uid <= 0:
-        return None
+        raise ValueError("Некорректная дата авторизации")
 
-    nonce_hash = hashlib.sha256(f"{uid}:{auth_date}:{received_hash}".encode("utf-8")).hexdigest()
+    now = int(time.time())
+
+    max_age = int(
+        getattr(config, "INIT_DATA_MAX_AGE_SEC", 86400)
+    )
+
+    if auth_date <= 0 or auth_date > now + 60:
+        raise ValueError("Некорректная дата авторизации")
+
+    if now - auth_date > max_age:
+        raise ValueError("Срок действия авторизации истёк")
+
+    try:
+        user = json.loads(data.get("user", "{}"))
+    except (TypeError, ValueError):
+        raise ValueError("Некорректные данные пользователя")
+
+    if not isinstance(user, dict):
+        raise ValueError("Некорректные данные пользователя")
+
+    try:
+        user_id = int(user.get("id", 0))
+    except (TypeError, ValueError):
+        user_id = 0
+
+    if user_id <= 0:
+        raise ValueError("Не удалось определить пользователя")
+
+    user["id"] = user_id
 
     return {
-        "id": uid,
-        "username": user_obj.get("username"),
-        "first_name": user_obj.get("first_name"),
-        "last_name": user_obj.get("last_name"),
-        "language_code": user_obj.get("language_code"),
-        "nonce_hash": nonce_hash,
+        "user": user,
+        "auth_date": auth_date,
+        "query_id": data.get("query_id"),
     }
 
 
-class _WebAppUser:
-    def __init__(self, d: dict[str, Any]):
-        self.id = d["id"]
-        self.username = d.get("username")
-        self.first_name = d.get("first_name")
-        self.last_name = d.get("last_name")
-        self.language_code = d.get("language_code")
+# --------------------------------------------------
+# АВТОРИЗАЦИЯ API
+# --------------------------------------------------
 
-
-def require_telegram_auth(fn):
-    @wraps(fn)
+def require_telegram_user(function):
+    @wraps(function)
     def wrapper(*args, **kwargs):
-        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
-        if not db.check_and_record_rate_limit(f"ip:{ip}", limit=120, window_sec=60):
-            return jsonify({"error": "Слишком много запросов"}), 429
+        init_data = request.headers.get(
+            "X-Telegram-Init-Data",
+            "",
+        )
 
-        init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
-        if not init_data and request.is_json:
-            body_json = request.get_json(silent=True) or {}
-            init_data = str(body_json.get("initData") or "").strip()
+        if not init_data:
+            init_data = request.headers.get(
+                "Authorization",
+                "",
+            )
 
-        parsed = verify_telegram_init_data(init_data, config.BOT_TOKEN, config.INIT_DATA_MAX_AGE_SEC)
-        if not parsed:
-            return jsonify({"error": "Недействительная или просроченная подпись Telegram WebApp"}), 401
+            if init_data.lower().startswith("tma "):
+                init_data = init_data[4:]
 
-        if not db.check_and_record_rate_limit(f"uid:{parsed['id']}", limit=60, window_sec=60):
-            return jsonify({"error": "Превышен лимит запросов"}), 429
+        try:
+            verified = validate_init_data(init_data)
 
-        tg_user = _WebAppUser(parsed)
-        db.upsert_user(tg_user)
-        g.tg_user = tg_user
-        g.user_id = parsed["id"]
-        g.nonce_hash = parsed["nonce_hash"]
-        return fn(*args, **kwargs)
+            telegram_user = verified["user"]
+
+            db.upsert_user(telegram_user)
+
+            g.telegram_user = telegram_user
+            g.telegram_user_id = telegram_user["id"]
+
+            return function(*args, **kwargs)
+
+        except ValueError as exc:
+            return error(str(exc), 401)
+
+        except Exception:
+            logger.exception("Ошибка авторизации Mini App")
+            return error("Ошибка авторизации", 500)
 
     return wrapper
 
 
-@api.get("/me")
-@require_telegram_auth
-def get_me():
-    profile = payments.get_wallet_profile(g.user_id)
-    topups = payments.list_topups(g.user_id, limit=10)
-    orders = shop.list_wallet_orders(g.user_id, limit=10)
-    return jsonify(
-        {
-            "ok": True,
-            "brand": config.BRAND,
-            "user": {
-                "id": profile["user_id"],
-                "username": profile["username"],
-                "first_name": profile["first_name"],
-                "last_name": profile["last_name"],
-                "is_admin": admin.is_admin(profile["user_id"]),
-            },
-            "wallet": {
-                "balance_uzs": profile["balance_uzs"],
-                "bonus_uzs": profile["bonus_uzs"],
-                "currency": "UZS",
-            },
-            "topup_config": {
-                "min_uzs": profile["topup_min_uzs"],
-                "max_uzs": profile["topup_max_uzs"],
-                "requisites": profile["requisites"],
-            },
-            "stats": {
-                "orders_count": len(orders),
-                "topups_count": len(topups),
-            },
-        }
-    )
+def _user_id():
+    return int(g.telegram_user_id)
 
+
+def _body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+
+def _positive_int(value, name, maximum=10**12):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Некорректное значение: {name}")
+
+    if number <= 0 or number > maximum:
+        raise ValueError(f"Недопустимое значение: {name}")
+
+    return number
+
+
+# --------------------------------------------------
+# ПРОВЕРКА РАБОТЫ API
+# --------------------------------------------------
+
+@api.get("/health")
+def health():
+    return success({
+        "service": "Gold Star Store API",
+        "status": "online",
+    })
+
+
+# --------------------------------------------------
+# ПРОФИЛЬ И КОШЕЛЁК
+# --------------------------------------------------
+
+@api.get("/me")
+@require_telegram_user
+def me():
+    user_id = _user_id()
+
+    user = db.get_user(user_id)
+    wallet = db.get_wallet(user_id)
+
+    if not user:
+        return error("Пользователь не найден", 404)
+
+    return success({
+        "user": dict(user),
+        "wallet": dict(wallet) if wallet else {
+            "balance_uzs": 0,
+            "bonus_uzs": 0,
+        },
+    })
+
+
+# --------------------------------------------------
+# КАТЕГОРИИ
+# --------------------------------------------------
+
+@api.get("/categories")
+@require_telegram_user
+def categories():
+    rows = shop.get_categories(active_only=True)
+
+    return success([
+        dict(row) for row in rows
+    ])
+
+
+# --------------------------------------------------
+# КАТАЛОГ ТОВАРОВ
+# --------------------------------------------------
 
 @api.get("/products")
-@require_telegram_auth
-def get_products():
-    category_slug = (request.args.get("category") or "").strip().lower() or None
-    categories = shop.list_categories()
-    products = shop.list_products(category_slug=category_slug)
-    return jsonify(
-        {
-            "ok": True,
-            "categories": categories,
-            "products": products,
-        }
+@require_telegram_user
+def products():
+    category = request.args.get("category")
+
+    rows = shop.get_products(
+        category_slug=category or None,
+        active_only=True,
     )
 
+    return success([
+        dict(row) for row in rows
+    ])
+
+
+@api.get("/products/<int:product_id>")
+@require_telegram_user
+def product_details(product_id):
+    product = shop.get_product(product_id)
+
+    if not product or not product["active"]:
+        return error("Товар не найден", 404)
+
+    return success(dict(product))
+
+
+# --------------------------------------------------
+# ИСТОРИЯ ЗАКАЗОВ
+# --------------------------------------------------
 
 @api.get("/history")
-@require_telegram_auth
-def get_history():
-    txs = payments.list_wallet_transactions(g.user_id, limit=50)
-    topups = payments.list_topups(g.user_id, limit=30)
-    orders = shop.list_wallet_orders(g.user_id, limit=30)
-    return jsonify(
-        {
-            "ok": True,
-            "transactions": txs,
-            "topups": topups,
-            "orders": orders,
-        }
-    )
+@require_telegram_user
+def history():
+    rows = shop.get_user_orders(_user_id())
 
+    return success([
+        dict(row) for row in rows
+    ])
+
+
+@api.get("/orders")
+@require_telegram_user
+def orders():
+    rows = shop.get_user_orders(_user_id())
+
+    return success([
+        dict(row) for row in rows
+    ])
+
+
+@api.get("/orders/<int:order_id>")
+@require_telegram_user
+def order_details(order_id):
+    order = shop.get_order(order_id)
+
+    if not order:
+        return error("Заказ не найден", 404)
+
+    if int(order["user_id"]) != _user_id():
+        return error("Заказ не найден", 404)
+
+    return success(dict(order))
+
+
+# --------------------------------------------------
+# ОФОРМЛЕНИЕ ЗАКАЗА
+# --------------------------------------------------
 
 @api.post("/orders")
-@require_telegram_auth
-def post_order():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "Ожидался JSON-объект"}), 400
-
-    if not db.check_and_record_rate_limit(f"ord_post:{g.user_id}", limit=15, window_sec=60):
-        return jsonify({"error": "Слишком частые запросы на оформление заказа"}), 429
+@require_telegram_user
+def create_order():
+    data = _body()
 
     try:
-        product_id = int(data.get("product_id"))
-        qty = int(data.get("qty", 1))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Некорректные параметры product_id или qty"}), 400
+        product_id = _positive_int(
+            data.get("product_id"),
+            "product_id",
+        )
 
-    recipient = str(data.get("recipient") or "").strip()
-    idempotency_key = str(data.get("idempotency_key") or "").strip()
-    if not idempotency_key:
-        idempotency_key = f"auto_{g.nonce_hash}_{product_id}_{qty}_{recipient}"
+        quantity = _positive_int(
+            data.get("quantity", data.get("qty", 1)),
+            "quantity",
+            maximum=100,
+        )
 
-    try:
-        order = shop.create_wallet_order(
-            user_id=g.user_id,
+        recipient = str(
+            data.get("recipient", "")
+        ).strip()
+
+        idempotency_key = str(
+            data.get("idempotency_key", "")
+        ).strip()
+
+        if not idempotency_key:
+            return error("Отсутствует ключ заказа")
+
+        if len(idempotency_key) > 128:
+            return error("Некорректный ключ заказа")
+
+        result = shop.create_wallet_order(
+            user_id=_user_id(),
             product_id=product_id,
-            qty=qty,
+            qty=quantity,
             recipient=recipient,
             idempotency_key=idempotency_key,
         )
-    except shop.ShopError as exc:
-        return jsonify({"error": str(exc)}), 400
 
-    if order.get("fulfillment_mode") == "manual":
-        admin.notify_admins_manual_order(order, g.tg_user)
+        return success(
+            result,
+            "Заказ оформлен",
+            201,
+        )
 
-    wallet = payments.get_wallet_profile(g.user_id)
-    return jsonify(
-        {
-            "ok": True,
-            "order": order,
-            "wallet": {
-                "balance_uzs": wallet["balance_uzs"],
-                "bonus_uzs": wallet["bonus_uzs"],
-                "currency": "UZS",
-            },
-        }
-    ), 201
+    except ValueError as exc:
+        return error(str(exc))
+
+    except PermissionError as exc:
+        return error(str(exc), 403)
+
+    except Exception:
+        logger.exception("Ошибка создания заказа")
+        return error("Не удалось оформить заказ", 500)
+
+
+# --------------------------------------------------
+# ЗАПРОСЫ НА ПОПОЛНЕНИЕ
+# --------------------------------------------------
+
+@api.get("/topups")
+@require_telegram_user
+def topups():
+    rows = payments.get_user_topups(_user_id())
+
+    return success([
+        dict(row) for row in rows
+    ])
 
 
 @api.post("/topups")
-@require_telegram_auth
-def post_topup():
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "Ожидался JSON-объект"}), 400
-
-    if not db.check_and_record_rate_limit(f"topup_post:{g.user_id}", limit=10, window_sec=60):
-        return jsonify({"error": "Слишком частые запросы на пополнение"}), 429
+@require_telegram_user
+def create_topup():
+    data = _body()
 
     try:
-        amount_uzs = int(data.get("amount_uzs"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Укажите корректную сумму пополнения в UZS"}), 400
+        amount = _positive_int(
+            data.get("amount_uzs", data.get("amount")),
+            "amount",
+        )
 
-    try:
-        topup = payments.create_topup_request(user_id=g.user_id, amount_uzs=amount_uzs)
-    except shop.ShopError as exc:
-        return jsonify({"error": str(exc)}), 400
+        minimum = int(
+            getattr(config, "TOPUP_MIN_UZS", 1000)
+        )
 
-    return jsonify(
-        {
-            "ok": True,
-            "topup": topup,
-            "requisites": config.TOPUP_REQUISITES,
-            "next_step": "Переведите указанную сумму по реквизитам и отправьте фото/скриншот чека в чат с ботом.",
-        }
-    ), 201
+        maximum = int(
+            getattr(config, "TOPUP_MAX_UZS", 100000000)
+        )
+
+        if amount < minimum or amount > maximum:
+            return error(
+                f"Сумма должна быть от {minimum} до {maximum} сум"
+            )
+
+        idempotency_key = str(
+            data.get("idempotency_key", "")
+        ).strip()
+
+        if not idempotency_key:
+            return error("Отсутствует ключ заявки")
+
+        if len(idempotency_key) > 128:
+            return error("Некорректный ключ заявки")
+
+        result = payments.create_topup(
+            user_id=_user_id(),
+            amount_uzs=amount,
+            idempotency_key=idempotency_key,
+        )
+
+        return success(
+            result,
+            "Заявка на пополнение создана",
+            201,
+        )
+
+    except ValueError as exc:
+        return error(str(exc))
+
+    except Exception:
+        logger.exception("Ошибка создания пополнения")
+        return error("Не удалось создать заявку", 500)
+
+
+# --------------------------------------------------
+# ИНФОРМАЦИЯ О ПОПОЛНЕНИИ
+# --------------------------------------------------
+
+@api.get("/topups/<int:topup_id>")
+@require_telegram_user
+def topup_details(topup_id):
+    topup = payments.get_topup(topup_id)
+
+    if not topup:
+        return error("Заявка не найдена", 404)
+
+    if int(topup["user_id"]) != _user_id():
+        return error("Заявка не найдена", 404)
+
+    return success(dict(topup))
+
+
+# --------------------------------------------------
+# ОБРАБОТКА ОШИБОК
+# --------------------------------------------------
+
+@api.errorhandler(404)
+def not_found(_exc):
+    return error("Маршрут не найден", 404)
+
+
+@api.errorhandler(405)
+def method_not_allowed(_exc):
+    return error("Метод не поддерживается", 405)
+
+
+@api.errorhandler(Exception)
+def internal_error(exc):
+    logger.exception("Необработанная ошибка API: %s", exc)
+    return error("Внутренняя ошибка сервера", 500)
