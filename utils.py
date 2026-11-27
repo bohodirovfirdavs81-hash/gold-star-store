@@ -1,8 +1,7 @@
-import datetime
 import html
 import logging
-import re
-import sys
+import os
+from datetime import datetime, timezone
 from typing import Any
 
 import telebot
@@ -10,114 +9,150 @@ from telebot import types
 
 import config
 
-STATUS_LABELS = {
-    "pending": "⏳ Ожидает",
-    "paid": "✅ Оплачен",
-    "processing": "⚙️ В обработке",
-    "delivered": "📦 Выполнен",
-    "cancelled": "❌ Отменён",
-    "refunded": "↩️ Возвращён",
-    "approved": "✅ Подтверждено",
-    "rejected": "❌ Отклонено",
-}
+logger = logging.getLogger(__name__)
 
-bot = telebot.TeleBot(config.BOT_TOKEN or "0:invalid_token", parse_mode="HTML")
+TOKEN = str(getattr(config, "BOT_TOKEN", "") or "").strip()
 
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан в настройках")
 
-def setup_logging() -> None:
-    root = logging.getLogger()
-    if root.handlers:
-        return
-    root.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-    root.addHandler(handler)
+bot = telebot.TeleBot(
+    TOKEN,
+    parse_mode="HTML",
+    threaded=True,
+    num_threads=8,
+)
 
 
-def h(val: Any) -> str:
-    return html.escape(str(val or ""), quote=True)
+def h(value: Any) -> str:
+    """Безопасное HTML-экранирование текста."""
+    return html.escape(str(value or ""), quote=True)
 
 
-def uzs(amount: int) -> str:
-    return f"{int(amount):,} UZS".replace(",", " ")
+def uzs(value: Any) -> str:
+    """Форматирование суммы в узбекских сумах."""
+    try:
+        amount = int(value or 0)
+    except (TypeError, ValueError):
+        amount = 0
+
+    return f"{amount:,}".replace(",", " ") + " сум"
 
 
-def stars(amount: int) -> str:
-    return f"{int(amount):,} ⭐".replace(",", " ")
+def fmt_dt(value: Any) -> str:
+    """Форматирование даты и времени."""
+    if not value:
+        return "не указано"
 
+    if isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    else:
+        raw = str(value).strip()
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return h(raw)
 
-def fmt_dt(ts: int | None) -> str:
-    if not ts:
-        return "—"
-    dt = datetime.datetime.fromtimestamp(int(ts), tz=datetime.timezone(datetime.timedelta(hours=5)))
     return dt.strftime("%d.%m.%Y %H:%M")
 
 
-def normalize_recipient(raw: str) -> str | None:
-    cleaned = (raw or "").strip()
-    if not cleaned.startswith("@"):
-        cleaned = "@" + cleaned
-    if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", cleaned):
-        return cleaned
-    return None
+def btn(text: str, callback_data: str) -> types.InlineKeyboardButton:
+    return types.InlineKeyboardButton(
+        text=str(text),
+        callback_data=str(callback_data),
+    )
 
 
-def btn(
-    text: str,
-    callback_data: str | None = None,
-    url: str | None = None,
-    web_app: str | None = None,
-) -> types.InlineKeyboardButton:
-    if web_app:
-        return types.InlineKeyboardButton(text=text, web_app=types.WebAppInfo(url=web_app))
-    if url:
-        return types.InlineKeyboardButton(text=text, url=url)
-    return types.InlineKeyboardButton(text=text, callback_data=callback_data or "u:noop")
-
-
-def kb(*rows: list[types.InlineKeyboardButton]) -> types.InlineKeyboardMarkup:
+def kb(rows: list) -> types.InlineKeyboardMarkup:
+    """Создание inline-клавиатуры."""
     markup = types.InlineKeyboardMarkup()
+
     for row in rows:
-        if row:
-            markup.row(*row)
+        if not isinstance(row, (list, tuple)):
+            row = [row]
+
+        markup.row(*row)
+
     return markup
 
 
-def safe_answer(call_id: str, text: str | None = None, alert: bool = False) -> None:
+def show(call, text: str, reply_markup=None) -> None:
+    """Обновление сообщения по callback."""
     try:
-        bot.answer_callback_query(call_id, text=text, show_alert=alert)
-    except Exception:  # noqa: BLE001
-        pass
+        if getattr(call.message, "content_type", "") == "photo":
+            bot.edit_message_caption(
+                caption=text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=reply_markup,
+            )
+        else:
+            bot.edit_message_text(
+                text=text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+    except Exception:
+        logger.exception("Не удалось обновить сообщение")
 
 
-def show(call: types.CallbackQuery, text: str, markup: types.InlineKeyboardMarkup | None = None) -> None:
-    msg = call.message
-    if not msg:
-        return
+def safe_answer(
+    callback_id: str,
+    text: str = "",
+    show_alert: bool = False,
+) -> None:
     try:
-        bot.edit_message_text(
-            chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            text=text,
-            reply_markup=markup,
+        bot.answer_callback_query(
+            callback_query_id=callback_id,
+            text=str(text or ""),
+            show_alert=show_alert,
+        )
+    except Exception:
+        logger.exception("Не удалось ответить на callback")
+
+
+def notify(user_id: int, text: str) -> bool:
+    """Отправка уведомления пользователю."""
+    try:
+        bot.send_message(
+            int(user_id),
+            text,
             disable_web_page_preview=True,
         )
-    except Exception:  # noqa: BLE001
-        try:
-            bot.send_message(msg.chat.id, text, reply_markup=markup, disable_web_page_preview=True)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def notify(user_id: int, text: str, markup: types.InlineKeyboardMarkup | None = None) -> bool:
-    try:
-        bot.send_message(int(user_id), text, reply_markup=markup, disable_web_page_preview=True)
         return True
-    except Exception:  # noqa: BLE001
-        logging.getLogger("goldstar.notify").warning("Не удалось отправить сообщение пользователю %s", user_id)
+    except Exception:
+        logger.exception("Не удалось отправить уведомление")
         return False
 
 
-def notify_admins(text: str, markup: types.InlineKeyboardMarkup | None = None) -> None:
-    for admin_id in config.ADMIN_IDS:
-        notify(admin_id, text, markup=markup)
+def normalize_recipient(value: Any) -> str:
+    """Нормализация получателя заказа."""
+    if value is None:
+        return ""
+
+    recipient = " ".join(str(value).strip().split())
+
+    if len(recipient) > 150:
+        raise ValueError("Слишком длинный идентификатор получателя")
+
+    return recipient
+
+
+def safe_send_message(
+    chat_id: int,
+    text: str,
+    reply_markup=None,
+) -> bool:
+    try:
+        bot.send_message(
+            int(chat_id),
+            text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+        return True
+    except Exception:
+        logger.exception("Не удалось отправить сообщение")
+        return False
