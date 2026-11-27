@@ -1,571 +1,188 @@
-# -*- coding: utf-8 -*-
-"""
-Gold Star Store — административная панель.
-"""
-
-from typing import Any
-
 import config
 import database as db
-import shop
 import payments
+import shop
+from utils import bot, btn, fmt_dt, h, kb, notify, safe_answer, show, uzs
 
 
-# --------------------------------------------------
-# ДОСТУП
-# --------------------------------------------------
-
-def is_admin(user_id: Any) -> bool:
+def is_admin(user_id: int | None) -> bool:
+    if not user_id:
+        return False
     try:
         uid = int(user_id)
     except (TypeError, ValueError):
         return False
-
-    if uid <= 0:
-        return False
-
-    admin_ids = getattr(config, "ADMIN_IDS", set())
-
-    try:
-        return uid in {int(x) for x in admin_ids}
-    except (TypeError, ValueError):
-        return False
+    return uid > 0 and uid in config.ADMIN_IDS
 
 
-def require_admin(user_id: int) -> None:
-    if not is_admin(user_id):
-        raise PermissionError("Недостаточно прав администратора")
+def send_topup_to_admins(topup: dict, user_obj) -> None:
+    tid = int(topup["id"])
+    uid = int(topup["user_id"])
+    amt = int(topup["amount_uzs"])
+    uname = f"@{user_obj.username}" if getattr(user_obj, "username", None) else "без username"
+    caption = (
+        f"💳 <b>Заявка на пополнение #{tid}</b>\n"
+        f"Пользователь: <code>{uid}</code> ({h(uname)})\n"
+        f"Сумма: <b>{uzs(amt)}</b>\n"
+        f"Статус: ожидает проверки поступления средств в банке"
+    )
+    if topup.get("receipt_caption"):
+        caption += f"\nКомментарий пользователя: {h(topup['receipt_caption'])}"
 
-
-def _admin_action(
-    admin_id: int,
-    action: str,
-    target_type: str = "",
-    target_id: Any = "",
-    details: Any = "",
-) -> None:
-    require_admin(admin_id)
-
-    db.record_admin_action(
-        admin_id,
-        action,
-        target_type or None,
-        str(target_id) if target_id else None,
-        details,
+    markup = kb(
+        [
+            btn("✅ Подтвердить", f"adm:topup_ok:{tid}"),
+            btn("❌ Отклонить", f"adm:topup_no:{tid}"),
+        ]
     )
 
-
-def _dict(row):
-    return dict(row) if row is not None else None
-
-
-# --------------------------------------------------
-# СТАТИСТИКА
-# --------------------------------------------------
-
-def get_stats(admin_id: int) -> dict:
-    require_admin(admin_id)
-
-    users = db.fetchone(
-        "SELECT COUNT(*) AS total FROM users"
-    )["total"]
-
-    products = db.fetchone(
-        "SELECT COUNT(*) AS total FROM products WHERE active = 1"
-    )["total"]
-
-    pending_topups = db.fetchone(
-        "SELECT COUNT(*) AS total FROM topups WHERE status = 'pending'"
-    )["total"]
-
-    pending_orders = db.fetchone(
-        "SELECT COUNT(*) AS total FROM wallet_orders WHERE status = 'pending'"
-    )["total"]
-
-    paid_orders = db.fetchone(
-        """
-        SELECT COUNT(*) AS total
-        FROM wallet_orders
-        WHERE status IN ('paid', 'processing', 'delivered')
-        """
-    )["total"]
-
-    topup_total = db.fetchone(
-        """
-        SELECT COALESCE(SUM(amount_uzs), 0) AS total
-        FROM topups
-        WHERE status = 'approved'
-        """
-    )["total"]
-
-    wallet_total = db.fetchone(
-        """
-        SELECT COALESCE(SUM(balance_uzs), 0) AS total
-        FROM wallets
-        """
-    )["total"]
-
-    bonus_total = db.fetchone(
-        """
-        SELECT COALESCE(SUM(bonus_uzs), 0) AS total
-        FROM wallets
-        """
-    )["total"]
-
-    return {
-        "users": int(users),
-        "products": int(products),
-        "pending_topups": int(pending_topups),
-        "pending_orders": int(pending_orders),
-        "paid_orders": int(paid_orders),
-        "approved_topups_uzs": int(topup_total),
-        "wallet_balance_uzs": int(wallet_total),
-        "wallet_bonus_uzs": int(bonus_total),
-    }
+    file_id = topup.get("receipt_file_id")
+    for admin_id in config.ADMIN_IDS:
+        try:
+            if file_id:
+                bot.send_photo(admin_id, file_id, caption=caption, reply_markup=markup)
+            else:
+                bot.send_message(admin_id, caption, reply_markup=markup, disable_web_page_preview=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
-# --------------------------------------------------
-# ПОЛЬЗОВАТЕЛИ
-# --------------------------------------------------
-
-def get_users(
-    admin_id: int,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[dict]:
-
-    require_admin(admin_id)
-
-    limit = max(1, min(int(limit), 100))
-    offset = max(0, int(offset))
-
-    rows = db.fetchall(
-        """
-        SELECT
-            u.telegram_id,
-            u.username,
-            u.first_name,
-            u.created_at,
-            w.balance_uzs,
-            w.bonus_uzs
-        FROM users u
-        LEFT JOIN wallets w ON w.user_id = u.telegram_id
-        ORDER BY u.created_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        (limit, offset),
+def notify_admins_manual_order(order: dict, buyer_obj=None) -> None:
+    oid = int(order["id"])
+    uid = int(order["user_id"])
+    buyer_label = f"id {uid}"
+    if buyer_obj and getattr(buyer_obj, "username", None):
+        buyer_label += f" (@{buyer_obj.username})"
+    text = (
+        f"🛠 <b>Заказ на ручную выдачу #{oid}</b>\n"
+        f"Покупатель: {h(buyer_label)}\n"
+        f"Получатель: <b>{h(order['recipient'])}</b>\n"
+        f"Товар: <b>{h(order['product_title'])}</b> × {int(order['qty'])}\n"
+        f"Сумма: <b>{uzs(int(order['total_uzs']))}</b>\n"
+        f"Списано с баланса: {uzs(int(order['paid_from_balance_uzs']))} | Бонусами: {uzs(int(order['paid_from_bonus_uzs']))}"
     )
-
-    return [_dict(row) for row in rows]
-
-
-def get_user_details(
-    admin_id: int,
-    user_id: int,
-) -> dict:
-
-    require_admin(admin_id)
-
-    user_id = int(user_id)
-
-    user = db.fetchone(
-        """
-        SELECT
-            u.*,
-            w.balance_uzs,
-            w.bonus_uzs
-        FROM users u
-        LEFT JOIN wallets w ON w.user_id = u.telegram_id
-        WHERE u.telegram_id = ?
-        """,
-        (user_id,),
+    markup = kb(
+        [
+            btn("📦 Выдано", f"adm:deliver:{oid}"),
+            btn("❌ Отменить и вернуть", f"adm:cancel_ord:{oid}"),
+        ]
     )
-
-    if not user:
-        raise ValueError("Пользователь не найден")
-
-    orders = db.fetchone(
-        """
-        SELECT COUNT(*) AS total
-        FROM wallet_orders
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    )["total"]
-
-    topups = db.fetchone(
-        """
-        SELECT COUNT(*) AS total
-        FROM topups
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    )["total"]
-
-    return {
-        "user": _dict(user),
-        "orders_count": int(orders),
-        "topups_count": int(topups),
-    }
-
-
-# --------------------------------------------------
-# ЗАКАЗЫ
-# --------------------------------------------------
-
-def get_orders(
-    admin_id: int,
-    status: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[dict]:
-
-    require_admin(admin_id)
-
-    limit = max(1, min(int(limit), 100))
-    offset = max(0, int(offset))
-
-    sql = """
-        SELECT
-            o.*,
-            u.username,
-            u.first_name
-        FROM wallet_orders o
-        LEFT JOIN users u ON u.telegram_id = o.user_id
-        WHERE 1 = 1
-    """
-
-    params = []
-
-    if status:
-        sql += " AND o.status = ?"
-        params.append(str(status))
-
-    sql += " ORDER BY o.id DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-
-    return [
-        _dict(row)
-        for row in db.fetchall(sql, tuple(params))
-    ]
-
-
-def get_order_details(
-    admin_id: int,
-    order_id: int,
-) -> dict:
-
-    require_admin(admin_id)
-
-    order = db.fetchone(
-        """
-        SELECT
-            o.*,
-            u.username,
-            u.first_name
-        FROM wallet_orders o
-        LEFT JOIN users u ON u.telegram_id = o.user_id
-        WHERE o.id = ?
-        """,
-        (int(order_id),),
-    )
-
-    if not order:
-        raise ValueError("Заказ не найден")
-
-    return _dict(order)
-
-
-def change_order_status(
-    admin_id: int,
-    order_id: int,
-    status: str,
-    comment: str = "",
-) -> dict:
-
-    require_admin(admin_id)
-
-    order_id = int(order_id)
-
-    allowed = {
-        "pending",
-        "paid",
-        "processing",
-        "delivered",
-        "rejected",
-    }
-
-    if status not in allowed:
-        raise ValueError("Недопустимый статус")
-
-    comment = str(comment or "").strip()
-
-    with db.transaction():
-        order = db.fetchone(
-            "SELECT * FROM wallet_orders WHERE id = ?",
-            (order_id,),
-        )
-
-        if not order:
-            raise ValueError("Заказ не найден")
-
-        old_status = order["status"]
-
-        if old_status in {"rejected", "refunded"}:
-            raise ValueError("Закрытый заказ нельзя изменить")
-
-        if old_status == "delivered" and status != "delivered":
-            raise ValueError("Выданный заказ нельзя вернуть в работу")
-
-        if old_status == status:
-            return _dict(order)
-
-        db.execute(
-            """
-            UPDATE wallet_orders
-            SET status = ?,
-                admin_comment = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (status, comment, db.now(), order_id),
-        )
-
-        _admin_action(
-            admin_id,
-            "change_order_status",
-            "wallet_order",
-            order_id,
-            {
-                "old_status": old_status,
-                "new_status": status,
-                "comment": comment,
-            },
-        )
-
-        return shop.get_order(order_id)
-
-
-# --------------------------------------------------
-# ПОПОЛНЕНИЯ
-# --------------------------------------------------
-
-def get_topups(
-    admin_id: int,
-    status: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[dict]:
-
-    require_admin(admin_id)
-
-    limit = max(1, min(int(limit), 100))
-    offset = max(0, int(offset))
-
-    sql = """
-        SELECT
-            t.*,
-            u.username,
-            u.first_name
-        FROM topups t
-        LEFT JOIN users u ON u.telegram_id = t.user_id
-        WHERE 1 = 1
-    """
-
-    params = []
-
-    if status:
-        sql += " AND t.status = ?"
-        params.append(str(status))
-
-    sql += " ORDER BY t.id DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
-
-    return [
-        _dict(row)
-        for row in db.fetchall(sql, tuple(params))
-    ]
-
-
-def approve_topup(
-    admin_id: int,
-    topup_id: int,
-    comment: str = "",
-) -> dict:
-
-    require_admin(admin_id)
-
-    result = payments.approve_topup(
-        topup_id,
-        admin_id,
-        comment,
-    )
-
-    return result
-
-
-def reject_topup(
-    admin_id: int,
-    topup_id: int,
-    reason: str = "",
-) -> dict:
-
-    require_admin(admin_id)
-
-    result = payments.reject_topup(
-        topup_id,
-        admin_id,
-        reason,
-    )
-
-    return result
-
-
-# --------------------------------------------------
-# ТОВАРЫ И КАТЕГОРИИ
-# --------------------------------------------------
-
-def get_products(admin_id: int) -> list[dict]:
-    require_admin(admin_id)
-
-    return shop.get_products(active_only=False)
-
-
-def add_product(
-    admin_id: int,
-    category_slug: str,
-    title: str,
-    description: str,
-    price_uzs: int,
-    fulfillment_mode: str = "manual",
-    price_xtr: int = 0,
-    sku: str | None = None,
-    image_url: str | None = None,
-    bonus_eligible: bool = True,
-) -> int:
-
-    require_admin(admin_id)
-
-    product_id = shop.create_product(
-        category_slug=category_slug,
-        title=title,
-        description=description,
-        price_uzs=price_uzs,
-        fulfillment_mode=fulfillment_mode,
-        price_xtr=price_xtr,
-        sku=sku,
-        image_url=image_url,
-        bonus_eligible=bonus_eligible,
-    )
-
-    _admin_action(
-        admin_id,
-        "add_product",
-        "product",
-        product_id,
-        {
-            "category": category_slug,
-            "title": title,
-            "price_uzs": price_uzs,
-            "price_xtr": price_xtr,
-            "fulfillment_mode": fulfillment_mode,
-        },
-    )
-
-    return product_id
-
-
-def set_product_active(
-    admin_id: int,
-    product_id: int,
-    active: bool,
-) -> bool:
-
-    require_admin(admin_id)
-
-    result = shop.set_product_active(product_id, active)
-
-    if result:
-        _admin_action(
-            admin_id,
-            "set_product_active",
-            "product",
-            product_id,
-            {"active": bool(active)},
-        )
-
-    return result
-
-
-def get_categories(admin_id: int) -> list[dict]:
-    require_admin(admin_id)
-
-    return shop.get_categories(active_only=False)
-
-
-def add_category(
-    admin_id: int,
-    slug: str,
-    title: str,
-    description: str = "",
-    sort_order: int = 0,
-) -> int:
-
-    require_admin(admin_id)
-
-    category_id = shop.create_category(
-        slug,
-        title,
-        description,
-        sort_order,
-    )
-
-    _admin_action(
-        admin_id,
-        "add_category",
-        "category",
-        category_id,
-        {"slug": slug, "title": title},
-    )
-
-    return category_id
-
-
-# --------------------------------------------------
-# ЖУРНАЛ АДМИНИСТРАТОРА
-# --------------------------------------------------
-
-def get_audit_log(
-    admin_id: int,
-    limit: int = 50,
-    offset: int = 0,
-) -> list[dict]:
-
-    require_admin(admin_id)
-
-    limit = max(1, min(int(limit), 100))
-    offset = max(0, int(offset))
-
-    rows = db.fetchall(
-        """
-        SELECT *
-        FROM admin_audit_log
-        ORDER BY id DESC
-        LIMIT ? OFFSET ?
-        """,
-        (limit, offset),
-    )
-
-    return [_dict(row) for row in rows]
-
-
-# --------------------------------------------------
-# СОВМЕСТИМОСТЬ С ДРУГИМИ МОДУЛЯМИ
-# --------------------------------------------------
-
-stats = get_stats
-users = get_users
-orders = get_orders
-topups = get_topups
-products = get_products
-audit_log = get_audit_log
+    for admin_id in config.ADMIN_IDS:
+        try:
+            bot.send_message(admin_id, text, reply_markup=markup, disable_web_page_preview=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def handle_state(message, fsm: dict) -> None:
+    uid = int(message.from_user.id)
+    if not is_admin(uid):
+        db.fsm_clear(uid)
+        return
+    state = fsm.get("state")
+    data = fsm.get("data") or {}
+    text = (message.text or "").strip()
+
+    if state == "adm_reject_reason":
+        tid = int(data.get("topup_id", 0))
+        db.fsm_clear(uid)
+        try:
+            res = payments.reject_topup_once(tid, uid, text)
+            bot.send_message(message.chat.id, f"Заявка #{tid}: {res['outcome']}")
+        except shop.ShopError as exc:
+            bot.send_message(message.chat.id, f"⚠️ {h(exc)}")
+        return
+
+    db.fsm_clear(uid)
+
+
+def register() -> None:
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("adm:"))
+    def on_admin_callback(call):
+        uid = int(call.from_user.id)
+        if not is_admin(uid):
+            return safe_answer(call.id, "Доступ запрещён", True)
+
+        parts = call.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+
+        if action == "topup_ok" and len(parts) > 2 and parts[2].isdigit():
+            tid = int(parts[2])
+            try:
+                res = payments.approve_topup_once(tid, uid)
+            except shop.ShopError as exc:
+                return safe_answer(call.id, str(exc), True)
+
+            outcome = res["outcome"]
+            if outcome == "approved":
+                safe_answer(call.id, "Пополнение подтверждено")
+                base_txt = call.message.caption or call.message.text or f"Заявка #{tid}"
+                show(
+                    call,
+                    f"{base_txt}\n\n✅ <b>Подтверждено администратором</b> ({fmt_dt(res['topup']['decided_at'])})",
+                )
+            elif outcome == "already_approved":
+                safe_answer(call.id, "Заявка уже была подтверждена ранее", True)
+            elif outcome == "already_rejected":
+                safe_answer(call.id, "Заявка уже была отклонена ранее", True)
+            else:
+                safe_answer(call.id, "Заявка уже обработана", True)
+            return
+
+        if action == "topup_no" and len(parts) > 2 and parts[2].isdigit():
+            tid = int(parts[2])
+            try:
+                res = payments.reject_topup_once(tid, uid, "Отклонено администратором")
+            except shop.ShopError as exc:
+                return safe_answer(call.id, str(exc), True)
+
+            outcome = res["outcome"]
+            if outcome == "rejected":
+                safe_answer(call.id, "Заявка отклонена")
+                base_txt = call.message.caption or call.message.text or f"Заявка #{tid}"
+                show(
+                    call,
+                    f"{base_txt}\n\n❌ <b>Отклонено администратором</b> ({fmt_dt(res['topup']['decided_at'])})",
+                )
+            elif outcome == "already_approved":
+                safe_answer(call.id, "Заявка уже была подтверждена ранее", True)
+            else:
+                safe_answer(call.id, "Заявка уже была отклонена ранее", True)
+            return
+
+        if action == "deliver" and len(parts) > 2 and parts[2].isdigit():
+            oid = int(parts[2])
+            try:
+                order = shop.mark_wallet_order_delivered(oid, uid)
+            except shop.ShopError as exc:
+                return safe_answer(call.id, str(exc), True)
+            safe_answer(call.id, "Заказ выполнен")
+            notify(
+                int(order["user_id"]),
+                f"📦 <b>Заказ #{oid} выполнен!</b>\n"
+                f"Товар: <b>{h(order['product_title'])}</b> × {int(order['qty'])} для <b>{h(order['recipient'])}</b>.",
+            )
+            base_txt = call.message.text or f"Заказ #{oid}"
+            show(call, f"{base_txt}\n\n📦 <b>Выдано администратором</b>")
+            return
+
+        if action == "cancel_ord" and len(parts) > 2 and parts[2].isdigit():
+            oid = int(parts[2])
+            try:
+                res = shop.refund_wallet_order_once(oid, uid, "Отменено администратором")
+            except shop.ShopError as exc:
+                return safe_answer(call.id, str(exc), True)
+            order = res["order"]
+            if res["already_refunded"]:
+                return safe_answer(call.id, "Средства по заказу уже были возвращены", True)
+            safe_answer(call.id, "Заказ отменён, средства возвращены")
+            notify(
+                int(order["user_id"]),
+                f"↩️ <b>Заказ #{oid} отменён</b>\n"
+                f"Средства возвращены на ваш баланс.",
+            )
+            base_txt = call.message.text or f"Заказ #{oid}"
+            show(call, f"{base_txt}\n\n❌ <b>Заказ отменён и возвращён</b>")
+            return
+
+        safe_answer(call.id)
