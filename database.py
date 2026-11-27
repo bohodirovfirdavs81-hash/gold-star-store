@@ -38,16 +38,18 @@ def get_conn() -> sqlite3.Connection:
 @contextlib.contextmanager
 def tx():
     conn = get_conn()
-    if conn.in_transaction:
-        yield conn
-        return
-    conn.execute("BEGIN IMMEDIATE")
+    started_here = False
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+        started_here = True
     try:
         yield conn
-        conn.execute("COMMIT")
+        if started_here and conn.in_transaction:
+            conn.execute("COMMIT")
     except Exception:
-        with contextlib.suppress(sqlite3.Error):
-            conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
         raise
 
 
@@ -113,7 +115,6 @@ def _seed_catalog_if_empty(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
-    # Сохраняем старую таблицу orders в legacy_orders, если она существовала со старой схемой
     if _table_exists(conn, "orders"):
         cols = _table_columns(conn, "orders")
         if "total_amount" in cols and "recipient" in cols:
@@ -135,7 +136,6 @@ def _migrate_legacy_tables(conn: sqlite3.Connection) -> None:
                 """
             )
 
-    # Если products существовал со старым столбцом price вместо price_uzs
     prod_cols = _table_columns(conn, "products")
     if prod_cols and "price_uzs" not in prod_cols and "price" in prod_cols:
         conn.execute("ALTER TABLE products ADD COLUMN price_uzs INTEGER NOT NULL DEFAULT 0")
@@ -174,7 +174,7 @@ def _run_one_time_wallet_reset(conn: sqlite3.Connection) -> None:
             """
             INSERT INTO wallet_transactions
                 (user_id, kind, amount_uzs, bonus_delta_uzs, balance_after_uzs, bonus_after_uzs, ref_type, ref_id, note, created_at)
-            VALUES (?, 'reset', 0, 0, 0, 0, 'system', 'wallet_init_v1', 'Однократный сброс баланса при запуске системы кошельков', ?)
+            VALUES (?, 'reset', 0, 0, 0, 0, 'system', 'wallet_init_v1', 'Однократный сброс баланса при запуске кошельков', ?)
             """,
             (uid, now),
         )
@@ -190,203 +190,206 @@ def _run_one_time_wallet_reset(conn: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
-    with tx() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS schema_state (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
+    conn = get_conn()
+    if conn.in_transaction:
+        conn.execute("COMMIT")
 
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
+    # DDL-скрипт выполняется отдельно, так как SQLite неявно завершает транзакцию при DDL
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                language_code TEXT,
-                is_blocked INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slug TEXT UNIQUE NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                sort_order INTEGER NOT NULL DEFAULT 0,
-                is_active INTEGER NOT NULL DEFAULT 1
-            );
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            language_code TEXT,
+            is_blocked INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_id INTEGER NOT NULL REFERENCES categories(id),
-                sku TEXT UNIQUE NOT NULL,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                price_uzs INTEGER NOT NULL CHECK(price_uzs >= 0),
-                fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
-                is_active INTEGER NOT NULL DEFAULT 1,
-                sort_order INTEGER NOT NULL DEFAULT 0
-            );
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1
+        );
 
-            CREATE TABLE IF NOT EXISTS cart_items (
-                user_id INTEGER NOT NULL,
-                product_id INTEGER NOT NULL REFERENCES products(id),
-                qty INTEGER NOT NULL CHECK(qty > 0),
-                PRIMARY KEY (user_id, product_id)
-            );
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER NOT NULL REFERENCES categories(id),
+            sku TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            price_uzs INTEGER NOT NULL CHECK(price_uzs >= 0),
+            fulfillment_mode TEXT NOT NULL DEFAULT 'auto',
+            is_active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        );
 
-            CREATE TABLE IF NOT EXISTS legacy_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                recipient TEXT NOT NULL,
-                total_amount INTEGER NOT NULL,
-                currency TEXT NOT NULL DEFAULT 'XTR',
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS cart_items (
+            user_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL REFERENCES products(id),
+            qty INTEGER NOT NULL CHECK(qty > 0),
+            PRIMARY KEY (user_id, product_id)
+        );
 
-            CREATE TABLE IF NOT EXISTS legacy_order_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL REFERENCES legacy_orders(id),
-                product_id INTEGER,
-                title TEXT NOT NULL,
-                price INTEGER NOT NULL,
-                qty INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS legacy_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            recipient TEXT NOT NULL,
+            total_amount INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'XTR',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                currency TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                payload TEXT,
-                telegram_charge_id TEXT UNIQUE,
-                provider_charge_id TEXT,
-                status TEXT NOT NULL DEFAULT 'paid',
-                problem TEXT,
-                created_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS legacy_order_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL REFERENCES legacy_orders(id),
+            product_id INTEGER,
+            title TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            qty INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS wallets (
-                user_id INTEGER PRIMARY KEY,
-                balance_uzs INTEGER NOT NULL DEFAULT 0 CHECK(balance_uzs >= 0),
-                bonus_uzs INTEGER NOT NULL DEFAULT 0 CHECK(bonus_uzs >= 0),
-                updated_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            currency TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            payload TEXT,
+            telegram_charge_id TEXT UNIQUE,
+            provider_charge_id TEXT,
+            status TEXT NOT NULL DEFAULT 'paid',
+            problem TEXT,
+            created_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS wallet_transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                amount_uzs INTEGER NOT NULL DEFAULT 0,
-                bonus_delta_uzs INTEGER NOT NULL DEFAULT 0,
-                balance_after_uzs INTEGER NOT NULL DEFAULT 0,
-                bonus_after_uzs INTEGER NOT NULL DEFAULT 0,
-                ref_type TEXT,
-                ref_id TEXT,
-                note TEXT,
-                created_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS wallets (
+            user_id INTEGER PRIMARY KEY,
+            balance_uzs INTEGER NOT NULL DEFAULT 0 CHECK(balance_uzs >= 0),
+            bonus_uzs INTEGER NOT NULL DEFAULT 0 CHECK(bonus_uzs >= 0),
+            updated_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS topups (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                amount_uzs INTEGER NOT NULL CHECK(amount_uzs > 0),
-                requisites TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                receipt_file_id TEXT,
-                receipt_caption TEXT,
-                admin_id INTEGER,
-                admin_comment TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                decided_at INTEGER
-            );
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            amount_uzs INTEGER NOT NULL DEFAULT 0,
+            bonus_delta_uzs INTEGER NOT NULL DEFAULT 0,
+            balance_after_uzs INTEGER NOT NULL DEFAULT 0,
+            bonus_after_uzs INTEGER NOT NULL DEFAULT 0,
+            ref_type TEXT,
+            ref_id TEXT,
+            note TEXT,
+            created_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS wallet_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_uid TEXT UNIQUE NOT NULL,
-                user_id INTEGER NOT NULL,
-                product_id INTEGER NOT NULL REFERENCES products(id),
-                sku TEXT NOT NULL,
-                product_title TEXT NOT NULL,
-                category_slug TEXT NOT NULL,
-                fulfillment_mode TEXT NOT NULL,
-                recipient TEXT NOT NULL,
-                qty INTEGER NOT NULL CHECK(qty > 0),
-                unit_price_uzs INTEGER NOT NULL CHECK(unit_price_uzs >= 0),
-                total_uzs INTEGER NOT NULL CHECK(total_uzs >= 0),
-                paid_from_balance_uzs INTEGER NOT NULL DEFAULT 0,
-                paid_from_bonus_uzs INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'paid',
-                refunded INTEGER NOT NULL DEFAULT 0,
-                admin_id INTEGER,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS topups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount_uzs INTEGER NOT NULL CHECK(amount_uzs > 0),
+            requisites TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            receipt_file_id TEXT,
+            receipt_caption TEXT,
+            admin_id INTEGER,
+            admin_comment TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            decided_at INTEGER
+        );
 
-            CREATE TABLE IF NOT EXISTS admin_audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER NOT NULL,
-                action TEXT NOT NULL,
-                target_type TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                details TEXT,
-                created_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS wallet_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_uid TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL REFERENCES products(id),
+            sku TEXT NOT NULL,
+            product_title TEXT NOT NULL,
+            category_slug TEXT NOT NULL,
+            fulfillment_mode TEXT NOT NULL,
+            recipient TEXT NOT NULL,
+            qty INTEGER NOT NULL CHECK(qty > 0),
+            unit_price_uzs INTEGER NOT NULL CHECK(unit_price_uzs >= 0),
+            total_uzs INTEGER NOT NULL CHECK(total_uzs >= 0),
+            paid_from_balance_uzs INTEGER NOT NULL DEFAULT 0,
+            paid_from_bonus_uzs INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'paid',
+            refunded INTEGER NOT NULL DEFAULT 0,
+            admin_id INTEGER,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS rate_limit_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bucket_key TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_rl_bucket_time ON rate_limit_events(bucket_key, created_at);
+        CREATE TABLE IF NOT EXISTS admin_audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            details TEXT,
+            created_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS used_init_nonces (
-                nonce_hash TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS rate_limit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bucket_key TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rl_bucket_time ON rate_limit_events(bucket_key, created_at);
 
-            CREATE TABLE IF NOT EXISTS fsm_states (
-                user_id INTEGER PRIMARY KEY,
-                state TEXT NOT NULL,
-                data_json TEXT NOT NULL DEFAULT '{}',
-                updated_at INTEGER NOT NULL
-            );
+        CREATE TABLE IF NOT EXISTS used_init_nonces (
+            nonce_hash TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
 
-            CREATE TABLE IF NOT EXISTS inbox_updates (
-                update_id INTEGER PRIMARY KEY,
-                payload TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                error TEXT,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL
-            );
-            """
-        )
+        CREATE TABLE IF NOT EXISTS fsm_states (
+            user_id INTEGER PRIMARY KEY,
+            state TEXT NOT NULL,
+            data_json TEXT NOT NULL DEFAULT '{}',
+            updated_at INTEGER NOT NULL
+        );
 
-        _migrate_legacy_tables(conn)
+        CREATE TABLE IF NOT EXISTS inbox_updates (
+            update_id INTEGER PRIMARY KEY,
+            payload TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        );
+        """
+    )
 
-        conn.execute(
+    with tx() as c:
+        _migrate_legacy_tables(c)
+        c.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', 'GoldStar_uz_bot')"
         )
-        conn.execute(
+        c.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('support_text', 'Напишите нам по вопросам заказов и пополнений баланса.')"
         )
-
-        _seed_catalog_if_empty(conn)
-        _run_one_time_wallet_reset(conn)
+        _seed_catalog_if_empty(c)
+        _run_one_time_wallet_reset(c)
 
 
 def ensure_wallet(conn: sqlite3.Connection, user_id: int) -> dict[str, int]:
