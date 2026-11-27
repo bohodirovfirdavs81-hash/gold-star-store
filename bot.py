@@ -1,551 +1,1209 @@
-"""Точка входа: Flask-приложение (Mini App + API + webhook) и Telegram-бот Gold Star Store.
-
-Запуск на Render:  gunicorn bot:app --workers 1 --threads 8
-Локально:          python bot.py
+# -*- coding: utf-8 -*-
 """
-import hmac
-import json
-import logging
-import os
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
+Gold Star Store — главный файл проекта.
 
-from flask import Flask, abort, jsonify, request, send_from_directory
+Стек:
+- Flask
+- pyTelegramBotAPI
+- SQLite
+- Telegram Webhook
+- Telegram Mini App
+- Telegram Stars (XTR)
+
+Запуск:
+gunicorn bot:app --workers 1 --threads 8
+"""
+
+import logging
+import secrets
+import threading
+
+from flask import Flask, jsonify, request, send_from_directory
 from telebot import types
 
-import admin
-import api
 import config
 import database as db
-import payments
 import shop
+import payments
+import admin
+
 from utils import (
-    STATUS_LABELS,
     bot,
-    btn,
-    fmt_dt,
     h,
+    uzs,
+    fmt_dt,
+    btn,
     kb,
     notify,
-    notify_admins,
     safe_answer,
-    setup_logging,
-    show,
-    stars,
-    uzs,
 )
 
-log = logging.getLogger("goldstar.bot")
-executor = ThreadPoolExecutor(max_workers=config.WORKER_THREADS, thread_name_prefix="upd")
-PAGE = 6
+
+# --------------------------------------------------
+# ЛОГИРОВАНИЕ
+# --------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+logger = logging.getLogger("gold_star")
 
 
-# =================================================================== экраны бота
-def v_home(uid: int):
-    profile = payments.get_wallet_profile(uid)
-    text = (
-        f"⭐ <b>{h(config.BRAND)}</b>\n\n"
-        f"Telegram Stars, Telegram Premium и подарки.\n"
-        f"Баланс: <b>{uzs(profile['balance_uzs'])}</b> | Бонусы: <b>{uzs(profile['bonus_uzs'])}</b>\n\n"
-        f"Основная работа магазина проходит в Mini App. Здесь вы можете посмотреть каталог, проверить статус заявок или отправить чек на пополнение."
-    )
-    rows = []
-    if config.WEBAPP_URL:
-        rows.append([btn("✨ Открыть Mini App", web_app=config.WEBAPP_URL)])
-    rows.append([btn("🛍 Каталог", "u:cats"), btn("💳 Пополнить", "u:topup_info")])
-    rows.append([btn("🧾 Заказы", "u:orders:0"), btn("🛟 Поддержка", "u:support")])
-    return text, kb(*rows)
+# --------------------------------------------------
+# FLASK
+# --------------------------------------------------
+
+app = Flask(
+    __name__,
+    static_folder="static",
+    static_url_path="/static",
+)
+
+app.config["SECRET_KEY"] = (
+    config.FLASK_SECRET_KEY or secrets.token_hex(32)
+)
+
+app.register_blueprint(__import__("api").api)
 
 
-def v_cats():
-    cats = shop.list_categories()
-    if not cats:
-        return "Каталог пока пуст. Загляните позже!", kb([btn("‹ Меню", "u:home")])
-    rows = [[btn(c["title"], f"u:cat:{c['id']}")] for c in cats]
-    rows.append([btn("‹ Меню", "u:home")])
-    return "🛍 <b>Каталог товаров</b>\nВыберите категорию (покупки доступны в Mini App):", kb(*rows)
+# --------------------------------------------------
+# ИНИЦИАЛИЗАЦИЯ БАЗЫ
+# --------------------------------------------------
+
+try:
+    db.init_db()
+    logger.info("База данных инициализирована")
+except Exception:
+    logger.exception("Ошибка инициализации базы данных")
+    raise
 
 
-def v_cat(cid: int):
-    cat = shop.get_category(cid)
-    if not cat or not cat["is_active"]:
-        return v_cats()
-    prods = shop.list_products(category_id=cid)
-    rows = []
-    for p in prods:
-        rows.append([btn(f"{p['title']} — {uzs(p['price_uzs'])}", f"u:prod:{p['id']}")])
-    if config.WEBAPP_URL:
-        rows.append([btn("✨ Купить в Mini App", web_app=config.WEBAPP_URL)])
-    rows.append([btn("‹ Категории", "u:cats")])
-    text = (
-        f"<b>{h(cat['title'])}</b>\n{h(cat['description'])}\n\n"
-        + ("Выберите позицию для просмотра:" if prods else "В этой категории пока нет товаров.")
-    )
-    return text, kb(*rows)
+# --------------------------------------------------
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# --------------------------------------------------
 
-
-def v_product(pid: int):
-    p = shop.get_product(pid, active_only=True)
-    if not p:
-        return "Товар недоступен.", kb([btn("‹ Каталог", "u:cats")])
-    mode_label = "Ручная выдача" if p["fulfillment_mode"] == "manual" else "Автовыдача"
-    text = (
-        f"<b>{h(p['title'])}</b>\n"
-        f"SKU: <code>{h(p['sku'])}</code> · {h(mode_label)}\n\n"
-        f"{h(p['description'])}\n\n"
-        f"Цена: <b>{uzs(p['price_uzs'])}</b>"
-    )
-    rows = []
-    if config.WEBAPP_URL:
-        rows.append([btn("✨ Оформить в Mini App", web_app=config.WEBAPP_URL)])
-    rows.append([btn("‹ Назад", f"u:cat:{p['category_id']}")])
-    return text, kb(*rows)
-
-
-def v_topup_info(uid: int):
-    pending = payments.get_latest_pending_topup(uid)
-    text = (
-        f"💳 <b>Пополнение баланса</b>\n\n"
-        f"1. Создайте заявку в Mini App на сумму от <b>{uzs(config.TOPUP_MIN_UZS)}</b> до <b>{uzs(config.TOPUP_MAX_UZS)}</b>.\n"
-        f"2. Переведите средства по реквизитам:\n<code>{h(config.TOPUP_REQUISITES)}</code>\n"
-        f"3. Отправьте фото или скриншот чека сюда в чат с ботом.\n"
-        f"4. После проверки поступления в банке администратор подтвердит заявку."
-    )
-    if pending:
-        text += (
-            f"\n\n📌 Ваша активная заявка: <b>#{pending['id']}</b> на сумму <b>{uzs(pending['amount_uzs'])}</b>. "
-            f"Просто отправьте фото/скриншот чека в этот чат."
-        )
-    rows = []
-    if config.WEBAPP_URL:
-        rows.append([btn("✨ Открыть Mini App", web_app=config.WEBAPP_URL)])
-    rows.append([btn("‹ Меню", "u:home")])
-    return text, kb(*rows)
-
-
-def v_orders(uid: int, page: int):
-    w_orders = shop.list_wallet_orders(uid, limit=PAGE, offset=page * PAGE)
-    if w_orders:
-        rows = [
-            [
-                btn(
-                    f"#{o['id']} · {STATUS_LABELS.get(o['status'], o['status'])} · {uzs(o['total_uzs'])}",
-                    f"u:worder:{o['id']}",
-                )
-            ]
-            for o in w_orders
+def user_name(user):
+    name = " ".join(
+        x for x in [
+            getattr(user, "first_name", ""),
+            getattr(user, "last_name", ""),
         ]
-        nav = []
-        if page > 0:
-            nav.append(btn("‹ Назад", f"u:orders:{page - 1}"))
-        if len(w_orders) == PAGE:
-            nav.append(btn("Вперёд ›", f"u:orders:{page + 1}"))
-        if nav:
-            rows.append(nav)
-        rows.append([btn("‹ Меню", "u:home")])
-        return "🧾 <b>Мои заказы</b>", kb(*rows)
-
-    total = shop.count_orders(uid)
-    if not total:
-        return "У вас пока нет заказов.", kb([btn("🛍 В каталог", "u:cats")], [btn("‹ Меню", "u:home")])
-    rows = [
-        [btn(f"#{o['id']} · {STATUS_LABELS.get(o['status'], o['status'])} · {stars(o['total'])}", f"u:order:{o['id']}")]
-        for o in shop.list_orders(uid, PAGE, page * PAGE)
-    ]
-    rows.append([btn("‹ Меню", "u:home")])
-    return "🧾 <b>История старых заказов</b>", kb(*rows)
-
-
-def v_worder(uid: int, oid: int):
-    o = shop.get_wallet_order(oid)
-    if not o or int(o["user_id"]) != int(uid):
-        return "Заказ не найден.", kb([btn("‹ Заказы", "u:orders:0")])
-    text = (
-        f"🧾 <b>Заказ #{o['id']}</b>\n"
-        f"Статус: {STATUS_LABELS.get(o['status'], o['status'])}\n"
-        f"Товар: <b>{h(o['product_title'])}</b> × {int(o['qty'])}\n"
-        f"Получатель: <b>{h(o['recipient'])}</b>\n"
-        f"Создан: {fmt_dt(o['created_at'])}\n"
-        f"Списано: <b>{uzs(int(o['total_uzs']))}</b>"
+        if x
     )
-    return text, kb([btn("‹ Заказы", "u:orders:0")])
+
+    return name or "Пользователь"
 
 
-def v_order(uid: int, oid: int):
-    o = shop.get_order(oid, uid)
-    if not o:
-        return "Заказ не найден.", kb([btn("‹ Заказы", "u:orders:0")])
-    items = "\n".join(f"• {h(i['title'])} × {i['qty']} — {stars(i['price'] * i['qty'])}" for i in o["items"])
-    text = (
-        f"🧾 <b>Заказ #{o['id']}</b>\n{STATUS_LABELS.get(o['status'], o['status'])}\n"
-        f"Получатель: <b>{h(o['recipient'])}</b>\nСоздан: {fmt_dt(o['created_at'])}\n\n{items}\n\n"
-        f"Итого: <b>{stars(o['total'])}</b>"
+def get_user_info(user):
+    return {
+        "id": user.id,
+        "username": getattr(user, "username", None),
+        "first_name": getattr(user, "first_name", ""),
+        "last_name": getattr(user, "last_name", ""),
+        "language_code": getattr(user, "language_code", None),
+        "is_premium": bool(
+            getattr(user, "is_premium", False)
+        ),
+    }
+
+
+def is_admin(user_id):
+    return admin.is_admin(user_id)
+
+
+def main_keyboard():
+    markup = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=1,
     )
-    return text, kb([btn("‹ Заказы", "u:orders:0")])
 
-
-def v_support():
-    uname = db.get_setting("support_username", "GoldStar_uz_bot")
-    text = db.get_setting("support_text", "Напишите нам по вопросам заказов и пополнений баланса.")
-    rows = []
-    msg = f"🛟 <b>Поддержка</b>\n\n{h(text)}"
-    if uname:
-        rows.append([btn(f"✉️ Написать @{uname}", url=f"https://t.me/{uname}")])
-    rows.append([btn("‹ Меню", "u:home")])
-    return msg, kb(*rows)
-
-
-# =================================================================== вспомогательное
-def _send(chat_id: int, view) -> None:
-    bot.send_message(chat_id, view[0], reply_markup=view[1], disable_web_page_preview=True)
-
-
-def _touch(user) -> None:
-    db.upsert_user(user)
-
-
-# =================================================================== обработчики
-def register_handlers() -> None:
-    admin.register()
-
-    @bot.message_handler(commands=["start", "menu"])
-    def cmd_start(m):
-        _touch(m.from_user)
-        db.fsm_clear(m.from_user.id)
-        _send(m.chat.id, v_home(m.from_user.id))
-
-    @bot.message_handler(commands=["help"])
-    def cmd_help(m):
-        _touch(m.from_user)
-        bot.send_message(
-            m.chat.id,
-            "/start — меню и Mini App\n/topup — инструкция по пополнению баланса\n/orders — мои заказы\n/support — поддержка\n/cancel — отмена действия",
+    if config.WEBAPP_URL:
+        markup.add(
+            types.KeyboardButton(
+                text="Открыть магазин",
+                web_app=types.WebAppInfo(
+                    url=config.WEBAPP_URL
+                ),
+            )
         )
 
-    @bot.message_handler(commands=["topup"])
-    def cmd_topup(m):
-        _touch(m.from_user)
-        _send(m.chat.id, v_topup_info(m.from_user.id))
+    markup.add(
+        types.KeyboardButton("Пополнить кошелёк"),
+        types.KeyboardButton("Мой профиль"),
+    )
 
-    @bot.message_handler(commands=["orders"])
-    def cmd_orders(m):
-        _touch(m.from_user)
-        _send(m.chat.id, v_orders(m.from_user.id, 0))
+    return markup
 
-    @bot.message_handler(commands=["support"])
-    def cmd_support(m):
-        _touch(m.from_user)
-        _send(m.chat.id, v_support())
 
-    @bot.message_handler(commands=["cancel"])
-    def cmd_cancel(m):
-        _touch(m.from_user)
-        db.fsm_clear(m.from_user.id)
-        bot.send_message(m.chat.id, "Действие отменено.", reply_markup=kb([btn("‹ Меню", "u:home")]))
+def notify_admins(text, reply_markup=None):
+    sent = 0
 
-    @bot.message_handler(content_types=["photo", "document"])
-    def on_receipt_media(m):
-        uid = int(m.from_user.id)
-        _touch(m.from_user)
-
-        pending = payments.get_latest_pending_topup(uid)
-        if not pending:
+    for admin_id in config.ADMIN_IDS:
+        try:
             bot.send_message(
-                m.chat.id,
-                "У вас нет активной заявки на пополнение. Сначала создайте заявку в Mini App, затем отправьте чек.",
-                reply_markup=kb([btn("‹ Меню", "u:home")]),
+                int(admin_id),
+                text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            sent += 1
+        except Exception:
+            logger.exception(
+                "Не удалось уведомить администратора %s",
+                admin_id,
+            )
+
+    return sent
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# --------------------------------------------------
+# СТАРТ
+# --------------------------------------------------
+
+@bot.message_handler(commands=["start"])
+def start_handler(message):
+    try:
+        db.upsert_user(get_user_info(message.from_user))
+
+        text = (
+            f"⭐ <b>{h(config.BRAND)}</b>\n\n"
+            "Добро пожаловать в магазин!\n\n"
+            "Здесь можно просматривать товары, "
+            "оформлять заказы и управлять кошельком.\n\n"
+            "Для открытия магазина нажмите кнопку ниже."
+        )
+
+        bot.send_message(
+            message.chat.id,
+            text,
+            reply_markup=main_keyboard(),
+            disable_web_page_preview=True,
+        )
+
+    except Exception:
+        logger.exception("Ошибка команды start")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось открыть магазин. Попробуйте позже.",
+        )
+
+
+# --------------------------------------------------
+# ПОМОЩЬ
+# --------------------------------------------------
+
+@bot.message_handler(commands=["help"])
+def help_handler(message):
+    text = (
+        "<b>Gold Star Store</b>\n\n"
+        "/start — открыть магазин\n"
+        "/topup — пополнить кошелёк\n"
+        "/profile — профиль и баланс\n"
+        "/stars — товары за Telegram Stars\n"
+        "/premium — запрос Premium\n"
+        "/gift — запрос подарка\n"
+        "/cancel — отменить текущую операцию\n"
+        "/admin — панель администратора"
+    )
+
+    bot.send_message(message.chat.id, text)
+
+
+# --------------------------------------------------
+# ПРОФИЛЬ
+# --------------------------------------------------
+
+@bot.message_handler(commands=["profile"])
+def profile_handler(message):
+    try:
+        user_id = message.from_user.id
+
+        db.upsert_user(get_user_info(message.from_user))
+
+        user = db.get_user(user_id)
+        wallet = db.get_wallet(user_id)
+
+        if not user:
+            bot.send_message(
+                message.chat.id,
+                "Не удалось загрузить профиль.",
             )
             return
 
+        balance = wallet["balance_uzs"] if wallet else 0
+        bonus = wallet["bonus_uzs"] if wallet else 0
+
+        text = (
+            "<b>Мой профиль</b>\n\n"
+            f"ID: <code>{user_id}</code>\n"
+            f"Имя: {h(user_name(message.from_user))}\n\n"
+            f"Основной баланс: <b>{uzs(balance)}</b>\n"
+            f"Бонусы: <b>{uzs(bonus)}</b>"
+        )
+
+        bot.send_message(message.chat.id, text)
+
+    except Exception:
+        logger.exception("Ошибка профиля")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить профиль.",
+        )
+
+
+@bot.message_handler(func=lambda m: m.text == "Мой профиль")
+def profile_button_handler(message):
+    profile_handler(message)
+
+
+# --------------------------------------------------
+# ПОПОЛНЕНИЕ КОШЕЛЬКА
+# --------------------------------------------------
+
+@bot.message_handler(commands=["topup"])
+@bot.message_handler(func=lambda m: m.text == "Пополнить кошелёк")
+def topup_start_handler(message):
+    db.upsert_user(get_user_info(message.from_user))
+
+    msg = bot.send_message(
+        message.chat.id,
+        (
+            "<b>Пополнение кошелька</b>\n\n"
+            f"Минимальная сумма: {uzs(config.TOPUP_MIN_UZS)}\n"
+            f"Максимальная сумма: {uzs(config.TOPUP_MAX_UZS)}\n\n"
+            "Отправьте сумму пополнения числом."
+        ),
+        reply_markup=types.ForceReply(
+            selective=True,
+            input_field_placeholder="Например: 50000",
+        ),
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        process_topup_amount,
+    )
+
+
+def process_topup_amount(message):
+    if not message.text:
+        bot.send_message(
+            message.chat.id,
+            "Отправьте сумму обычным текстом.",
+        )
+        return
+
+    try:
+        amount = int(message.text.strip().replace(" ", ""))
+
+        if not (
+            config.TOPUP_MIN_UZS
+            <= amount
+            <= config.TOPUP_MAX_UZS
+        ):
+            raise ValueError("Сумма вне допустимого диапазона")
+
+        db.upsert_user(get_user_info(message.from_user))
+
+        topup = payments.create_topup(
+            user_id=message.from_user.id,
+            amount_uzs=amount,
+            idempotency_key=secrets.token_urlsafe(24),
+        )
+
+        topup_id = int(topup["id"])
+
+        requisites = config.TOPUP_REQUISITES
+
+        text = (
+            f"<b>Заявка №{topup_id}</b>\n\n"
+            f"Сумма: <b>{uzs(amount)}</b>\n\n"
+            "<b>Реквизиты для оплаты:</b>\n"
+            f"{h(requisites)}\n\n"
+            "После перевода отправьте фотографию "
+            "или файл чека в ответ на это сообщение.\n\n"
+            "Важно: баланс будет пополнен только "
+            "после проверки платежа администратором."
+        )
+
+        msg = bot.send_message(
+            message.chat.id,
+            text,
+            reply_markup=types.ForceReply(
+                selective=True,
+                input_field_placeholder="Отправьте чек",
+            ),
+        )
+
+        bot.register_next_step_handler(
+            msg,
+            process_topup_receipt,
+            topup_id,
+        )
+
+    except ValueError as exc:
+        bot.send_message(
+            message.chat.id,
+            f"Ошибка: {h(exc)}\n\n"
+            "Введите корректную сумму.",
+        )
+
+    except Exception:
+        logger.exception("Ошибка создания пополнения")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось создать заявку. Попробуйте позже.",
+        )
+
+
+def process_topup_receipt(message, topup_id):
+    try:
         file_id = None
-        if m.content_type == "photo" and m.photo:
-            file_id = m.photo[-1].file_id
-        elif m.content_type == "document" and m.document:
-            mime = (m.document.mime_type or "").lower()
-            if mime.startswith("image/") or mime == "application/pdf":
-                file_id = m.document.file_id
+
+        if message.photo:
+            file_id = message.photo[-1].file_id
+
+        elif message.document:
+            file_id = message.document.file_id
 
         if not file_id:
-            bot.send_message(m.chat.id, "Пожалуйста, отправьте скриншот или фото чека (изображение или PDF).")
+            bot.send_message(
+                message.chat.id,
+                "Необходимо отправить фотографию или файл чека.",
+            )
             return
 
-        caption = (m.caption or "").strip()
-        try:
-            updated_topup = payments.attach_topup_receipt(int(pending["id"]), uid, file_id, caption)
-        except shop.ShopError as exc:
-            bot.send_message(m.chat.id, f"⚠️ {h(exc)}")
-            return
+        topup = payments.attach_topup_receipt(
+            topup_id=topup_id,
+            user_id=message.from_user.id,
+            file_id=file_id,
+            note=message.caption or "",
+        )
 
-        admin.send_topup_to_admins(updated_topup, m.from_user)
+        text = (
+            "<b>Получен чек пополнения</b>\n\n"
+            f"Заявка: #{topup_id}\n"
+            f"Пользователь: {message.from_user.id}\n"
+            f"Сумма: {uzs(topup['amount_uzs'])}\n\n"
+            "Проверьте фактическое поступление денег."
+        )
+
+        markup = kb([
+            [
+                btn(
+                    "Подтвердить",
+                    f"topup:approve:{topup_id}",
+                ),
+                btn(
+                    "Отклонить",
+                    f"topup:reject:{topup_id}",
+                ),
+            ]
+        ])
+
+        for admin_id in config.ADMIN_IDS:
+            try:
+                if message.photo:
+                    bot.send_photo(
+                        admin_id,
+                        file_id,
+                        caption=text,
+                        reply_markup=markup,
+                    )
+                else:
+                    bot.send_document(
+                        admin_id,
+                        file_id,
+                        caption=text,
+                        reply_markup=markup,
+                    )
+            except Exception:
+                logger.exception(
+                    "Не удалось отправить чек администратору"
+                )
+
         bot.send_message(
-            m.chat.id,
-            f"🧾 <b>Чек по заявке #{updated_topup['id']} отправлен администратору.</b>\n"
-            f"Сумма: <b>{uzs(int(updated_topup['amount_uzs']))}</b>.\n"
-            f"Ожидайте проверки поступления средств в банке.",
-            reply_markup=kb([btn("‹ Меню", "u:home")]),
+            message.chat.id,
+            (
+                f"Чек по заявке №{topup_id} получен.\n\n"
+                "Заявка ожидает проверки администратора. "
+                "Деньги пока не начислены."
+            ),
         )
 
-    @bot.pre_checkout_query_handler(func=lambda q: True)
-    def on_pre_checkout(query):
-        payments.handle_pre_checkout(query)
-
-    @bot.message_handler(content_types=["successful_payment"])
-    def on_successful_payment(m):
-        sp = m.successful_payment
-        uid = int(m.from_user.id)
-        _touch(m.from_user)
-        res = payments.record_payment(
-            uid,
-            sp.currency,
-            sp.total_amount,
-            sp.invoice_payload,
-            sp.telegram_payment_charge_id,
-            getattr(sp, "provider_payment_charge_id", "") or "",
+    except ValueError as exc:
+        bot.send_message(
+            message.chat.id,
+            f"Ошибка: {h(exc)}",
         )
-        if res["result"] == "duplicate":
-            return
-        if res["result"] == "paid" and res.get("order"):
-            notify(
-                uid,
-                f"✅ <b>Оплата получена!</b> Заказ #{res['order']['id']} принят.",
-                kb([btn("🧾 Мои заказы", "u:orders:0")]),
+
+    except Exception:
+        logger.exception("Ошибка обработки чека")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось обработать чек. Обратитесь к администратору.",
+        )
+
+
+# --------------------------------------------------
+# ОТМЕНА ОПЕРАЦИИ
+# --------------------------------------------------
+
+@bot.message_handler(commands=["cancel"])
+def cancel_handler(message):
+    try:
+        bot.clear_step_handler_by_chat_id(
+            message.chat.id
+        )
+    except Exception:
+        logger.exception("Ошибка отмены шага")
+
+    bot.send_message(
+        message.chat.id,
+        "Текущая операция отменена.",
+        reply_markup=main_keyboard(),
+    )
+
+
+# --------------------------------------------------
+# АДМИНИСТРАТИВНАЯ ПАНЕЛЬ
+# --------------------------------------------------
+
+@bot.message_handler(commands=["admin"])
+def admin_handler(message):
+    admin_id = message.from_user.id
+
+    if not is_admin(admin_id):
+        bot.send_message(
+            message.chat.id,
+            "Доступ запрещён.",
+        )
+        return
+
+    try:
+        stats = admin.get_stats(admin_id)
+
+        text = (
+            "<b>Панель администратора</b>\n\n"
+            f"Пользователей: {stats['users']}\n"
+            f"Активных товаров: {stats['products']}\n"
+            f"Ожидающих пополнений: {stats['pending_topups']}\n"
+            f"Ожидающих заказов: {stats['pending_orders']}\n"
+            f"Завершённых/оплаченных заказов: {stats['paid_orders']}\n\n"
+            f"Баланс пользователей: "
+            f"{uzs(stats['wallet_balance_uzs'])}\n"
+            f"Бонусы пользователей: "
+            f"{uzs(stats['wallet_bonus_uzs'])}\n"
+            f"Подтверждённые пополнения: "
+            f"{uzs(stats['approved_topups_uzs'])}"
+        )
+
+        markup = kb([
+            [btn("Ожидающие пополнения", "admin:topups")],
+            [btn("Последние заказы", "admin:orders")],
+            [btn("Последние пользователи", "admin:users")],
+        ])
+
+        bot.send_message(
+            message.chat.id,
+            text,
+            reply_markup=markup,
+        )
+
+    except Exception:
+        logger.exception("Ошибка панели администратора")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить панель.",
+        )
+
+
+# --------------------------------------------------
+# CALLBACK АДМИНИСТРАТОРА
+# --------------------------------------------------
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:")
+)
+def admin_callback(call):
+    admin_id = call.from_user.id
+
+    if not is_admin(admin_id):
+        safe_answer(
+            call.id,
+            "Доступ запрещён",
+            True,
+        )
+        return
+
+    try:
+        action = call.data.split(":")[1]
+
+        if action == "topups":
+            rows = admin.get_topups(
+                admin_id,
+                status="pending",
+                limit=20,
             )
-            notify_admins(f"💰 Оплата счёта #{res['order']['id']} ({stars(sp.total_amount)})")
-        elif res.get("problem"):
-            notify(
-                uid,
-                f"⚠️ Платёж получен, но требует проверки администратором (<code>{h(res['problem'])}</code>).",
+
+            if not rows:
+                show(
+                    call,
+                    "Ожидающих пополнений нет.",
+                    kb([[btn("Назад", "admin:home")]]),
+                )
+                return
+
+            text = "<b>Ожидающие пополнения</b>\n\n"
+            buttons = []
+
+            for row in rows:
+                topup_id = row["id"]
+
+                text += (
+                    f"#{topup_id} — "
+                    f"{uzs(row['amount_uzs'])}\n"
+                    f"Пользователь: {row['user_id']}\n"
+                    f"Чек: {'есть' if row['receipt_file_id'] else 'нет'}\n\n"
+                )
+
+                buttons.append([
+                    btn(
+                        f"Заявка #{topup_id}",
+                        f"admin:topup:{topup_id}",
+                    )
+                ])
+
+            buttons.append([
+                btn("Назад", "admin:home")
+            ])
+
+            show(call, text, kb(buttons))
+
+        elif action == "topup":
+            topup_id = int(call.data.split(":")[2])
+
+            row = payments.get_topup(topup_id)
+
+            if not row:
+                safe_answer(call.id, "Заявка не найдена", True)
+                return
+
+            text = (
+                f"<b>Заявка №{topup_id}</b>\n\n"
+                f"Пользователь: {row['user_id']}\n"
+                f"Сумма: {uzs(row['amount_uzs'])}\n"
+                f"Статус: {h(row['status'])}\n"
+                f"Чек: {'есть' if row['receipt_file_id'] else 'нет'}"
             )
-            notify_admins(f"⚠️ Платёж на проверке: {stars(sp.total_amount)}, причина: <code>{h(res['problem'])}</code>")
 
-    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("u:"))
-    def on_user_callback(call):
-        uid = int(call.from_user.id)
-        _touch(call.from_user)
-        p = call.data.split(":")
-        a = p[1] if len(p) > 1 else ""
+            buttons = []
 
-        def go(view, toast=None):
-            safe_answer(call.id, toast)
-            show(call, view[0], view[1])
+            if row["receipt_file_id"]:
+                buttons.append([
+                    btn("Подтвердить", f"topup:approve:{topup_id}"),
+                    btn("Отклонить", f"topup:reject:{topup_id}"),
+                ])
 
-        if a == "noop":
-            return safe_answer(call.id)
-        if a == "home":
-            db.fsm_clear(uid)
-            return go(v_home(uid))
-        if a == "cats":
-            return go(v_cats())
-        if a == "cat" and len(p) > 2 and p[2].isdigit():
-            return go(v_cat(int(p[2])))
-        if a == "prod" and len(p) > 2 and p[2].isdigit():
-            return go(v_product(int(p[2])))
-        if a == "topup_info":
-            return go(v_topup_info(uid))
-        if a == "orders" and len(p) > 2 and p[2].isdigit():
-            return go(v_orders(uid, int(p[2])))
-        if a == "worder" and len(p) > 2 and p[2].isdigit():
-            return go(v_worder(uid, int(p[2])))
-        if a == "order" and len(p) > 2 and p[2].isdigit():
-            return go(v_order(uid, int(p[2])))
-        if a == "support":
-            return go(v_support())
+            buttons.append([
+                btn("Назад", "admin:topups")
+            ])
+
+            show(call, text, kb(buttons))
+
+        elif action == "orders":
+            rows = admin.get_orders(
+                admin_id,
+                limit=15,
+            )
+
+            if not rows:
+                show(
+                    call,
+                    "Заказов пока нет.",
+                    kb([[btn("Назад", "admin:home")]]),
+                )
+                return
+
+            text = "<b>Последние заказы</b>\n\n"
+            buttons = []
+
+            for row in rows:
+                text += (
+                    f"Заказ #{row['id']}\n"
+                    f"Пользователь: {row['user_id']}\n"
+                    f"Товар: {h(row['product_title'])}\n"
+                    f"Сумма: {uzs(row['total_price_uzs'])}\n"
+                    f"Статус: {h(row['status'])}\n\n"
+                )
+
+                buttons.append([
+                    btn(
+                        f"Заказ #{row['id']}",
+                        f"admin:order:{row['id']}",
+                    )
+                ])
+
+            buttons.append([
+                btn("Назад", "admin:home")
+            ])
+
+            show(call, text, kb(buttons))
+
+        elif action == "order":
+            order_id = int(call.data.split(":")[2])
+            row = admin.get_order_details(admin_id, order_id)
+
+            text = (
+                f"<b>Заказ №{order_id}</b>\n\n"
+                f"Пользователь: {row['user_id']}\n"
+                f"Товар: {h(row['product_title'])}\n"
+                f"Количество: {row['qty']}\n"
+                f"Сумма: {uzs(row['total_price_uzs'])}\n"
+                f"Баланс использован: {uzs(row['balance_used_uzs'])}\n"
+                f"Бонусы использованы: {uzs(row['bonus_used_uzs'])}\n"
+                f"Статус: {h(row['status'])}"
+            )
+
+            buttons = []
+
+            for status, label in [
+                ("processing", "В обработку"),
+                ("delivered", "Выдан"),
+                ("rejected", "Отклонён"),
+            ]:
+                buttons.append([
+                    btn(
+                        label,
+                        f"admin:orderstatus:{order_id}:{status}",
+                    )
+                ])
+
+            buttons.append([
+                btn("Назад", "admin:orders")
+            ])
+
+            show(call, text, kb(buttons))
+
+        elif action == "orderstatus":
+            parts = call.data.split(":")
+            order_id = int(parts[2])
+            status = parts[3]
+
+            admin.change_order_status(
+                admin_id,
+                order_id,
+                status,
+                "Изменено через Telegram",
+            )
+
+            safe_answer(call.id, "Статус изменён")
+
+            row = admin.get_order_details(
+                admin_id,
+                order_id,
+            )
+
+            notify(
+                row["user_id"],
+                (
+                    f"Статус вашего заказа №{order_id} изменён: "
+                    f"<b>{h(status)}</b>"
+                ),
+            )
+
+            show(
+                call,
+                f"Статус заказа №{order_id} изменён.",
+                kb([[btn("К заказам", "admin:orders")]]),
+            )
+
+        elif action == "users":
+            rows = admin.get_users(
+                admin_id,
+                limit=15,
+            )
+
+            text = "<b>Последние пользователи</b>\n\n"
+
+            for row in rows:
+                text += (
+                    f"ID: <code>{row['telegram_id']}</code>\n"
+                    f"Имя: {h(row['first_name'])}\n"
+                    f"Баланс: {uzs(row['balance_uzs'])}\n\n"
+                )
+
+            show(
+                call,
+                text or "Пользователей пока нет.",
+                kb([[btn("Назад", "admin:home")]]),
+            )
+
+        elif action == "home":
+            stats = admin.get_stats(admin_id)
+
+            text = (
+                "<b>Панель администратора</b>\n\n"
+                f"Пользователей: {stats['users']}\n"
+                f"Товаров: {stats['products']}\n"
+                f"Ожидающих пополнений: {stats['pending_topups']}\n"
+                f"Ожидающих заказов: {stats['pending_orders']}"
+            )
+
+            show(
+                call,
+                text,
+                kb([
+                    [btn("Пополнения", "admin:topups")],
+                    [btn("Заказы", "admin:orders")],
+                    [btn("Пользователи", "admin:users")],
+                ]),
+            )
+
         safe_answer(call.id)
 
-    @bot.message_handler(content_types=["text"], func=lambda m: bool(m.text) and not m.text.startswith("/"))
-    def on_text(m):
-        uid = int(m.from_user.id)
-        _touch(m.from_user)
-        fsm = db.fsm_get(uid)
-        if fsm and admin.is_admin(uid):
-            return admin.handle_state(m, fsm)
-        if fsm:
-            db.fsm_clear(uid)
-        _send(m.chat.id, v_home(uid))
+    except Exception:
+        logger.exception("Ошибка callback администратора")
+        safe_answer(
+            call.id,
+            "Не удалось выполнить действие",
+            True,
+        )
 
 
-# =================================================================== обработка апдейтов
-def process_update(update_id: int) -> None:
-    row = db.inbox_claim(update_id)
-    if not row:
+# --------------------------------------------------
+# ПОДТВЕРЖДЕНИЕ И ОТКЛОНЕНИЕ ПОПОЛНЕНИЙ
+# --------------------------------------------------
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("topup:")
+)
+def topup_admin_callback(call):
+    admin_id = call.from_user.id
+
+    if not is_admin(admin_id):
+        safe_answer(call.id, "Доступ запрещён", True)
         return
+
     try:
-        update = types.Update.de_json(row["payload"])
-        bot.process_new_updates([update])
-        db.inbox_done(update_id)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("update %s failed", update_id)
-        db.inbox_fail(update_id, repr(exc))
+        _, action, raw_id = call.data.split(":")
+        topup_id = int(raw_id)
 
-
-def _sweeper() -> None:
-    last_cleanup = 0.0
-    while True:
-        time.sleep(60)
-        try:
-            for uid in db.inbox_recover():
-                executor.submit(process_update, uid)
-            if time.time() - last_cleanup > 86400:
-                db.inbox_cleanup()
-                last_cleanup = time.time()
-        except Exception:  # noqa: BLE001
-            log.exception("sweeper error")
-
-
-def _setup_webhook() -> None:
-    delay = 2
-    while True:
-        try:
-            bot.set_webhook(
-                url=f"{config.WEBHOOK_URL}/webhook",
-                secret_token=config.WEBHOOK_SECRET,
-                allowed_updates=config.ALLOWED_UPDATES,
+        if action == "approve":
+            result = admin.approve_topup(
+                admin_id,
+                topup_id,
+                "Подтверждено администратором",
             )
-            log.info("webhook set: %s/webhook", config.WEBHOOK_URL)
-            break
-        except Exception:  # noqa: BLE001
-            log.exception("set_webhook failed, retry in %ss", delay)
-            time.sleep(delay)
-            delay = min(delay * 2, 60)
 
-    try:
-        bot.set_my_commands(
-            [
-                types.BotCommand("start", "Главное меню и Mini App"),
-                types.BotCommand("topup", "Пополнение баланса"),
-                types.BotCommand("orders", "Мои заказы"),
-                types.BotCommand("support", "Поддержка"),
-            ]
+            notify(
+                result["user_id"],
+                (
+                    f"Пополнение №{topup_id} подтверждено.\n"
+                    f"Начислено: <b>{uzs(result['amount_uzs'])}</b>"
+                ),
+            )
+
+            show(
+                call,
+                f"Пополнение №{topup_id} подтверждено.",
+            )
+
+            safe_answer(call.id, "Баланс пополнен")
+
+        elif action == "reject":
+            result = admin.reject_topup(
+                admin_id,
+                topup_id,
+                "Отклонено администратором",
+            )
+
+            notify(
+                result["user_id"],
+                (
+                    f"Пополнение №{topup_id} отклонено.\n"
+                    "Баланс не изменён."
+                ),
+            )
+
+            show(
+                call,
+                f"Пополнение №{topup_id} отклонено.",
+            )
+
+            safe_answer(call.id, "Заявка отклонена")
+
+        else:
+            safe_answer(call.id, "Неизвестное действие", True)
+
+    except ValueError as exc:
+        safe_answer(call.id, str(exc), True)
+
+    except Exception:
+        logger.exception("Ошибка обработки пополнения")
+        safe_answer(
+            call.id,
+            "Не удалось обработать заявку",
+            True,
         )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("set_my_commands failed: %s", exc)
-
-    if config.WEBAPP_URL:
-        try:
-            bot.set_chat_menu_button(
-                menu_button=types.MenuButtonWebApp(
-                    type="web_app",
-                    text="Магазин",
-                    web_app=types.WebAppInfo(config.WEBAPP_URL),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("set_chat_menu_button failed: %s", exc)
 
 
-def _acquire_leader_lock() -> bool:
-    try:
-        import fcntl
-    except ImportError:
-        return True
+# --------------------------------------------------
+# ЗАПРОСЫ PREMIUM И GIFTS
+# --------------------------------------------------
 
-    path = config.DATABASE_PATH + ".lock"
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    fd = open(path, "w")  # noqa: SIM115
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fd.close()
-        return False
-    globals()["_lock_fd"] = fd
-    return True
+def request_admin(message, request_type):
+    db.upsert_user(get_user_info(message.from_user))
 
-
-# =================================================================== Flask
-def create_app() -> Flask:
-    setup_logging()
-    app = Flask(__name__, static_folder="static", template_folder="static")
-    app.config.update(
-        SECRET_KEY=config.FLASK_SECRET_KEY,
-        MAX_CONTENT_LENGTH=10 * 1024 * 1024,
-        JSON_AS_ASCII=False,
-        SEND_FILE_MAX_AGE_DEFAULT=300,
+    text = (
+        f"<b>Новая заявка: {h(request_type)}</b>\n\n"
+        f"Пользователь: {h(user_name(message.from_user))}\n"
+        f"Telegram ID: <code>{message.from_user.id}</code>\n"
+        f"Username: @{h(message.from_user.username or 'нет')}\n\n"
+        "Пользователь хочет связаться по поводу заказа."
     )
-    app.register_blueprint(api.api)
 
-    @app.get("/")
-    def index():
-        return send_from_directory(app.static_folder, "index.html")
+    sent = notify_admins(text)
 
-    @app.get("/healthz")
-    def healthz():
-        try:
-            db.q_one("SELECT 1 AS ok")
-            return jsonify({"status": "ok"})
-        except Exception:  # noqa: BLE001
-            log.exception("healthz failed")
-            return jsonify({"status": "db_error"}), 500
-
-    @app.post("/webhook")
-    def webhook():
-        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if not config.WEBHOOK_SECRET or not hmac.compare_digest(token, config.WEBHOOK_SECRET):
-            abort(403)
-        raw = request.get_data(cache=False, as_text=True)
-        try:
-            update_id = int(json.loads(raw)["update_id"])
-        except (ValueError, KeyError, TypeError):
-            abort(400)
-        try:
-            inserted = db.inbox_add(update_id, raw)
-        except Exception:  # noqa: BLE001
-            log.exception("inbox_add failed")
-            return "", 500
-        if inserted:
-            executor.submit(process_update, update_id)
-        return "", 200
-
-    @app.after_request
-    def security_headers(resp):
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        resp.headers["Referrer-Policy"] = "no-referrer"
-        resp.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self' https://telegram.org 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; "
-            "frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org"
+    if sent:
+        bot.send_message(
+            message.chat.id,
+            "Заявка отправлена администраторам. "
+            "Ожидайте ответа.",
         )
-        if request.path.startswith("/api/"):
-            resp.headers["Cache-Control"] = "no-store"
-        return resp
-
-    @app.errorhandler(400)
-    def bad_request(err):
-        return jsonify({"error": getattr(err, "description", None) or "Некорректный запрос"}), 400
-
-    @app.errorhandler(404)
-    def not_found(_):
-        return jsonify({"error": "Не найдено"}), 404
-
-    @app.errorhandler(413)
-    def too_large(_):
-        return jsonify({"error": "Превышен размер запроса"}), 413
-
-    @app.errorhandler(500)
-    def server_error(_):
-        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
-
-    return app
-
-
-def boot() -> Flask:
-    app = create_app()
-    for problem in config.problems():
-        log.error("Конфигурация: %s", problem)
-    db.init_db()
-    register_handlers()
-    if _acquire_leader_lock():
-        for uid in db.inbox_recover(startup=True):
-            executor.submit(process_update, uid)
-        threading.Thread(target=_sweeper, name="sweeper", daemon=True).start()
-        if config.AUTO_SET_WEBHOOK and not config.problems():
-            threading.Thread(target=_setup_webhook, name="webhook-setup", daemon=True).start()
     else:
-        log.warning("Другой процесс уже держит блокировку — фоновые задачи не запускаются")
-    return app
+        bot.send_message(
+            message.chat.id,
+            "Не удалось отправить заявку. Попробуйте позже.",
+        )
 
 
-app = boot()
+@bot.message_handler(commands=["premium"])
+def premium_handler(message):
+    request_admin(message, "Telegram Premium")
+
+
+@bot.message_handler(commands=["gift"])
+def gift_handler(message):
+    request_admin(message, "Telegram Gifts")
+
+
+# --------------------------------------------------
+# TELEGRAM STARS — СПИСОК ТОВАРОВ
+# --------------------------------------------------
+
+@bot.message_handler(commands=["stars"])
+def stars_handler(message):
+    try:
+        db.upsert_user(get_user_info(message.from_user))
+
+        products = shop.get_products(
+            category_slug="other",
+            active_only=True,
+        )
+
+        buttons = []
+
+        for product in products:
+            if product.get("fulfillment_mode") != "xtr":
+                continue
+
+            price = safe_int(product.get("price_xtr"))
+
+            if price <= 0:
+                continue
+
+            buttons.append([
+                btn(
+                    f"{product['title']} — {price} ⭐",
+                    f"stars:buy:{product['id']}",
+                )
+            ])
+
+        if not buttons:
+            bot.send_message(
+                message.chat.id,
+                "Сейчас нет товаров для оплаты Telegram Stars.",
+            )
+            return
+
+        bot.send_message(
+            message.chat.id,
+            (
+                "<b>Товары за Telegram Stars</b>\n\n"
+                "Выберите товар для оплаты."
+            ),
+            reply_markup=kb(buttons),
+        )
+
+    except Exception:
+        logger.exception("Ошибка списка Stars")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить товары.",
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("stars:buy:")
+)
+def stars_buy_callback(call):
+    try:
+        product_id = int(call.data.split(":")[2])
+
+        db.upsert_user(get_user_info(call.from_user))
+
+        payments.create_xtr_invoice(
+            bot=bot,
+            chat_id=call.message.chat.id,
+            user_id=call.from_user.id,
+            product_id=product_id,
+        )
+
+        safe_answer(call.id, "Счёт создан")
+
+    except ValueError as exc:
+        safe_answer(call.id, str(exc), True)
+
+    except Exception:
+        logger.exception("Ошибка создания Stars invoice")
+        safe_answer(
+            call.id,
+            "Не удалось создать счёт",
+            True,
+        )
+
+
+# --------------------------------------------------
+# TELEGRAM STARS — PRE-CHECKOUT
+# --------------------------------------------------
+
+@bot.pre_checkout_query_handler(
+    func=lambda query: True
+)
+def pre_checkout_handler(query):
+    try:
+        valid, message = payments.validate_xtr_pre_checkout(
+            user_id=query.from_user.id,
+            payload=query.invoice_payload,
+            currency=query.currency,
+            total_amount=query.total_amount,
+        )
+
+        bot.answer_pre_checkout_query(
+            query.id,
+            ok=valid,
+            error_message=None if valid else message,
+        )
+
+    except Exception:
+        logger.exception("Ошибка pre-checkout")
+
+        bot.answer_pre_checkout_query(
+            query.id,
+            ok=False,
+            error_message="Не удалось проверить платёж",
+        )
+
+
+# --------------------------------------------------
+# TELEGRAM STARS — УСПЕШНАЯ ОПЛАТА
+# --------------------------------------------------
+
+@bot.message_handler(
+    content_types=["successful_payment"]
+)
+def successful_payment_handler(message):
+    payment = message.successful_payment
+
+    try:
+        result = payments.process_xtr_success(
+            user_id=message.from_user.id,
+            payload=payment.invoice_payload,
+            currency=payment.currency,
+            total_amount=payment.total_amount,
+            telegram_charge_id=payment.telegram_payment_charge_id,
+        )
+
+        bot.send_message(
+            message.chat.id,
+            (
+                "<b>Оплата успешно получена!</b>\n\n"
+                f"Товар: {h(result['product_title'])}\n"
+                f"Сумма: {result['amount_xtr']} ⭐\n"
+                f"Заказ: #{result['id']}"
+            ),
+        )
+
+        notify_admins(
+            (
+                "<b>Новая оплата Telegram Stars</b>\n\n"
+                f"Пользователь: {message.from_user.id}\n"
+                f"Товар: {h(result['product_title'])}\n"
+                f"Сумма: {result['amount_xtr']} ⭐\n"
+                f"Заказ: #{result['id']}"
+            )
+        )
+
+    except Exception:
+        logger.exception("Ошибка обработки успешной оплаты")
+
+        bot.send_message(
+            message.chat.id,
+            (
+                "Telegram сообщил об успешной оплате, "
+                "но магазин не смог завершить обработку заказа. "
+                "Обратитесь к администратору и укажите ID платежа."
+            ),
+        )
+
+        notify_admins(
+            (
+                "<b>Требуется проверка платежа Stars</b>\n\n"
+                f"Пользователь: {message.from_user.id}\n"
+                f"Telegram charge ID: "
+                f"<code>{h(payment.telegram_payment_charge_id)}</code>\n"
+                "Проверьте платёж и заказ вручную."
+            )
+        )
+
+
+# --------------------------------------------------
+# WEBHOOK TELEGRAM
+# --------------------------------------------------
+
+@app.post("/telegram/webhook")
+def telegram_webhook():
+    expected_secret = config.WEBHOOK_SECRET
+
+    if not expected_secret:
+        return jsonify({"ok": False}), 503
+
+    received_secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token",
+        "",
+    )
+
+    if not secrets.compare_digest(
+        received_secret,
+        expected_secret,
+    ):
+        return jsonify({"ok": False}), 403
+
+    try:
+        update_data = request.get_json(force=True)
+
+        if not isinstance(update_data, dict):
+            return jsonify({"ok": False}), 400
+
+        update = types.Update.de_json(update_data)
+
+        bot.process_new_updates([update])
+
+        return jsonify({"ok": True})
+
+    except Exception:
+        logger.exception("Ошибка обработки webhook")
+        return jsonify({"ok": False}), 500
+
+
+# --------------------------------------------------
+# MINI APP
+# --------------------------------------------------
+
+@app.get("/")
+def index():
+    return send_from_directory(
+        "static",
+        "index.html",
+    )
+
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "service": "Gold Star Store",
+    })
+
+
+# --------------------------------------------------
+# ОШИБКИ FLASK
+# --------------------------------------------------
+
+@app.errorhandler(404)
+def not_found(_error):
+    return jsonify({
+        "ok": False,
+        "error": "Not found",
+    }), 404
+
+
+@app.errorhandler(500)
+def internal_error(_error):
+    logger.exception("Ошибка Flask")
+    return jsonify({
+        "ok": False,
+        "error": "Internal server error",
+    }), 500
+
+
+# --------------------------------------------------
+# УСТАНОВКА WEBHOOK
+# --------------------------------------------------
+
+def configure_webhook():
+    if not config.AUTO_SET_WEBHOOK:
+        logger.info("Автоматическая установка webhook отключена")
+        return
+
+    if not config.WEBHOOK_URL:
+        logger.error("WEBHOOK_URL не задан")
+        return
+
+    if not config.WEBHOOK_SECRET:
+        logger.error("WEBHOOK_SECRET не задан")
+        return
+
+    webhook_url = (
+        config.WEBHOOK_URL.rstrip("/")
+        + "/telegram/webhook"
+    )
+
+    try:
+        bot.set_webhook(
+            url=webhook_url,
+            secret_token=config.WEBHOOK_SECRET,
+            allowed_updates=config.ALLOWED_UPDATES,
+        )
+
+        logger.info("Webhook установлен: %s", webhook_url)
+
+    except Exception:
+        logger.exception("Не удалось установить webhook")
+
+
+if config.AUTO_SET_WEBHOOK:
+    configure_webhook()
+
+
+# --------------------------------------------------
+# ЛОКАЛЬНЫЙ ЗАПУСК
+# --------------------------------------------------
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=False, use_reloader=False)
+    app.run(
+        host="0.0.0.0",
+        port=8080,
+        debug=False,
+        threaded=True,
+    )
