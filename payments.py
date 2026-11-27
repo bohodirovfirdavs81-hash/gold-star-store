@@ -1,384 +1,872 @@
-import time
+# -*- coding: utf-8 -*-
+"""
+Gold Star Store — платежи и пополнения.
+
+Поддерживает:
+- Ручные пополнения UZS с подтверждением администратора.
+- Telegram Stars (XTR) только для категории other.
+- Защиту от повторного начисления и повторной обработки платежей.
+
+Важно:
+Чек пользователя сам по себе не подтверждает оплату.
+Начисление UZS выполняется только после решения администратора.
+"""
+
+import json
+import secrets
+import sqlite3
 from typing import Any
 
-from telebot import types
-
-import config
 import database as db
-from shop import ShopError
-from utils import bot, h, notify, uzs
+import shop
 
 
-def get_wallet_profile(user_id: int) -> dict[str, Any]:
-    uid = int(user_id)
-    with db.tx() as conn:
-        user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (uid,)).fetchone()
-        wallet = db.ensure_wallet(conn, uid)
-    return {
-        "user_id": uid,
-        "username": user["username"] if user else None,
-        "first_name": user["first_name"] if user else None,
-        "last_name": user["last_name"] if user else None,
-        "balance_uzs": int(wallet["balance_uzs"]),
-        "bonus_uzs": int(wallet["bonus_uzs"]),
-        "topup_min_uzs": config.TOPUP_MIN_UZS,
-        "topup_max_uzs": config.TOPUP_MAX_UZS,
-        "requisites": config.TOPUP_REQUISITES,
-    }
+# --------------------------------------------------
+# НАСТРОЙКИ
+# --------------------------------------------------
 
+def _config_int(name: str, default: int) -> int:
+    import config
 
-def list_wallet_transactions(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
-    return db.q_all(
-        """
-        SELECT * FROM wallet_transactions
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (int(user_id), int(limit)),
-    )
-
-
-def create_topup_request(user_id: int, amount_uzs: int) -> dict[str, Any]:
-    uid = int(user_id)
     try:
-        amt = int(amount_uzs)
-    except (TypeError, ValueError) as exc:
-        raise ShopError("Введите корректную целую сумму в UZS") from exc
+        return int(getattr(config, name, default))
+    except (TypeError, ValueError):
+        return default
 
-    if amt < config.TOPUP_MIN_UZS:
-        raise ShopError(f"Минимальная сумма пополнения: {uzs(config.TOPUP_MIN_UZS)}")
-    if amt > config.TOPUP_MAX_UZS:
-        raise ShopError(f"Максимальная сумма пополнения: {uzs(config.TOPUP_MAX_UZS)}")
 
-    now = int(time.time())
-    with db.tx() as conn:
-        db.ensure_wallet(conn, uid)
-        pending_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM topups WHERE user_id = ? AND status = 'pending'",
-            (uid,),
-        ).fetchone()["c"]
-        if int(pending_count) >= 5:
-            raise ShopError("У вас уже есть активные необработанные заявки на пополнение. Дождитесь решения администратора.")
+TOPUP_MIN_UZS = _config_int("TOPUP_MIN_UZS", 1000)
+TOPUP_MAX_UZS = _config_int("TOPUP_MAX_UZS", 10000000)
 
-        cur = conn.execute(
-            """
-            INSERT INTO topups (user_id, amount_uzs, requisites, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'pending', ?, ?)
-            """,
-            (uid, amt, config.TOPUP_REQUISITES, now, now),
+
+def _uid(value: Any) -> int:
+    value = int(value or 0)
+
+    if value <= 0:
+        raise ValueError("Некорректный ID пользователя")
+
+    return value
+
+
+def _positive(value: Any, name: str) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Некорректное значение: {name}")
+
+    if value <= 0:
+        raise ValueError(f"{name} должен быть больше нуля")
+
+    return value
+
+
+def _dict(row):
+    return dict(row) if row is not None else None
+
+
+# --------------------------------------------------
+# РУЧНЫЕ ПОПОЛНЕНИЯ
+# --------------------------------------------------
+
+def create_topup(
+    user_id: int,
+    amount_uzs: int,
+    idempotency_key: str | None = None,
+) -> dict:
+    """
+    Создаёт заявку на пополнение.
+    Деньги на этом этапе не начисляются.
+    """
+
+    user_id = _uid(user_id)
+    amount_uzs = _positive(amount_uzs, "Сумма")
+
+    if not TOPUP_MIN_UZS <= amount_uzs <= TOPUP_MAX_UZS:
+        raise ValueError(
+            f"Сумма должна быть от {TOPUP_MIN_UZS} "
+            f"до {TOPUP_MAX_UZS} сум"
         )
-        tid = int(cur.lastrowid)
-        row = conn.execute("SELECT * FROM topups WHERE id = ?", (tid,)).fetchone()
-        topup = dict(row)
 
-    # Бот также отправляет реквизиты пользователю в личный чат (если чат открыт)
-    notify(
-        uid,
-        f"💳 <b>Заявка на пополнение #{tid} создана</b>\n"
-        f"Сумма: <b>{uzs(amt)}</b>\n\n"
-        f"Реквизиты для перевода:\n<code>{h(config.TOPUP_REQUISITES)}</code>\n\n"
-        f"После перевода отправьте фото или скриншот чека в этот чат.",
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip()
+
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ValueError("Некорректный ключ заявки")
+
+    timestamp = db.now()
+
+    with db.transaction():
+        user = db.get_user(user_id)
+
+        if not user:
+            raise ValueError("Пользователь не найден")
+
+        if idempotency_key:
+            existing = db.fetchone(
+                """
+                SELECT *
+                FROM topups
+                WHERE user_id = ? AND idempotency_key = ?
+                """,
+                (user_id, idempotency_key),
+            )
+
+            if existing:
+                return _dict(existing)
+
+        cursor = db.execute(
+            """
+            INSERT INTO topups(
+                user_id,
+                amount_uzs,
+                status,
+                idempotency_key,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                user_id,
+                amount_uzs,
+                idempotency_key,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+        topup = db.fetchone(
+            "SELECT * FROM topups WHERE id = ?",
+            (cursor.lastrowid,),
+        )
+
+        return _dict(topup)
+
+
+def get_topup(topup_id: int):
+    topup_id = _positive(topup_id, "ID пополнения")
+
+    return _dict(
+        db.fetchone(
+            "SELECT * FROM topups WHERE id = ?",
+            (topup_id,),
+        )
     )
-    return topup
 
 
-def list_topups(user_id: int, limit: int = 30) -> list[dict[str, Any]]:
-    return db.q_all(
+def get_user_topups(
+    user_id: int,
+    limit: int = 30,
+) -> list[dict]:
+
+    user_id = _uid(user_id)
+    limit = max(1, min(int(limit), 100))
+
+    rows = db.fetchall(
         """
-        SELECT * FROM topups
+        SELECT *
+        FROM topups
         WHERE user_id = ?
         ORDER BY id DESC
         LIMIT ?
         """,
-        (int(user_id), int(limit)),
+        (user_id, limit),
     )
 
-
-def get_topup(topup_id: int) -> dict[str, Any] | None:
-    return db.q_one("SELECT * FROM topups WHERE id = ?", (int(topup_id),))
+    return [_dict(row) for row in rows]
 
 
-def get_latest_pending_topup(user_id: int) -> dict[str, Any] | None:
-    return db.q_one(
+def get_pending_topups(limit: int = 50) -> list[dict]:
+    limit = max(1, min(int(limit), 100))
+
+    rows = db.fetchall(
         """
-        SELECT * FROM topups
-        WHERE user_id = ? AND status = 'pending'
-        ORDER BY id DESC
-        LIMIT 1
+        SELECT
+            t.*,
+            u.username,
+            u.first_name
+        FROM topups t
+        LEFT JOIN users u ON u.telegram_id = t.user_id
+        WHERE t.status = 'pending'
+        ORDER BY t.id ASC
+        LIMIT ?
         """,
-        (int(user_id),),
+        (limit,),
     )
+
+    return [_dict(row) for row in rows]
 
 
 def attach_topup_receipt(
     topup_id: int,
     user_id: int,
     file_id: str,
-    caption: str = "",
-) -> dict[str, Any]:
-    now = int(time.time())
-    with db.tx() as conn:
-        row = conn.execute(
-            "SELECT * FROM topups WHERE id = ? AND user_id = ?",
-            (int(topup_id), int(user_id)),
-        ).fetchone()
-        if not row:
-            raise ShopError("Заявка на пополнение не найдена")
-        if row["status"] != "pending":
-            raise ShopError("По этой заявке уже принято решение")
-        conn.execute(
+    note: str = "",
+) -> dict:
+    """
+    Сохраняет Telegram file_id чека.
+    Не подтверждает оплату.
+    """
+
+    topup_id = _positive(topup_id, "ID пополнения")
+    user_id = _uid(user_id)
+
+    file_id = str(file_id or "").strip()
+    note = str(note or "").strip()
+
+    if not file_id:
+        raise ValueError("Не указан файл чека")
+
+    if len(note) > 1000:
+        raise ValueError("Комментарий слишком длинный")
+
+    with db.transaction():
+        topup = db.fetchone(
+            """
+            SELECT *
+            FROM topups
+            WHERE id = ? AND user_id = ?
+            """,
+            (topup_id, user_id),
+        )
+
+        if not topup:
+            raise ValueError("Заявка не найдена")
+
+        if topup["status"] != "pending":
+            raise ValueError("Эта заявка уже обработана")
+
+        db.execute(
             """
             UPDATE topups
-            SET receipt_file_id = ?, receipt_caption = ?, updated_at = ?
-            WHERE id = ? AND status = 'pending'
-            """,
-            (file_id, (caption or "")[:500], now, int(topup_id)),
-        )
-        updated = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-        return dict(updated)
-
-
-def approve_topup_once(topup_id: int, admin_id: int, comment: str = "") -> dict[str, Any]:
-    """Подтверждает заявку и зачисляет средства ровно один раз."""
-    now = int(time.time())
-    with db.tx() as conn:
-        row = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-        if not row:
-            raise ShopError("Заявка не найдена")
-        status = row["status"]
-        if status == "approved":
-            return {"outcome": "already_approved", "topup": dict(row)}
-        if status == "rejected":
-            return {"outcome": "already_rejected", "topup": dict(row)}
-        if status != "pending":
-            raise ShopError(f"Некорректный статус заявки: {status}")
-
-        uid = int(row["user_id"])
-        amt = int(row["amount_uzs"])
-        wallet = db.ensure_wallet(conn, uid)
-        new_bal = int(wallet["balance_uzs"]) + amt
-        new_bonus = int(wallet["bonus_uzs"])
-
-        upd = conn.execute(
-            """
-            UPDATE topups
-            SET status = 'approved', admin_id = ?, admin_comment = ?, updated_at = ?, decided_at = ?
-            WHERE id = ? AND status = 'pending'
-            """,
-            (int(admin_id), (comment or "Подтверждено администратором")[:300], now, now, int(topup_id)),
-        )
-        if upd.rowcount != 1:
-            latest = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-            return {"outcome": "already_processed", "topup": dict(latest)}
-
-        conn.execute(
-            """
-            UPDATE wallets
-            SET balance_uzs = balance_uzs + ?, updated_at = ?
-            WHERE user_id = ?
-            """,
-            (amt, now, uid),
-        )
-        conn.execute(
-            """
-            INSERT INTO wallet_transactions (
-                user_id, kind, amount_uzs, bonus_delta_uzs,
-                balance_after_uzs, bonus_after_uzs, ref_type, ref_id, note, created_at
-            ) VALUES (?, 'topup', ?, 0, ?, ?, 'topup', ?, ?, ?)
-            """,
-            (uid, amt, new_bal, new_bonus, str(topup_id), f"Пополнение баланса по заявке #{topup_id}", now),
-        )
-        conn.execute(
-            """
-            INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, created_at)
-            VALUES (?, 'approve_topup', 'topup', ?, ?, ?)
-            """,
-            (int(admin_id), str(topup_id), f"Зачислено {amt} UZS. {comment}".strip(), now),
-        )
-        updated = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-
-    notify(
-        uid,
-        f"✅ <b>Пополнение подтверждено!</b>\n"
-        f"Заявка <b>#{topup_id}</b> на сумму <b>{uzs(amt)}</b> зачислена на ваш баланс.\n"
-        f"Текущий баланс: <b>{uzs(new_bal)}</b>.",
-    )
-    return {"outcome": "approved", "topup": dict(updated), "balance_after_uzs": new_bal}
-
-
-def reject_topup_once(topup_id: int, admin_id: int, comment: str = "") -> dict[str, Any]:
-    """Отклоняет заявку без изменения баланса."""
-    now = int(time.time())
-    with db.tx() as conn:
-        row = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-        if not row:
-            raise ShopError("Заявка не найдена")
-        status = row["status"]
-        if status == "approved":
-            return {"outcome": "already_approved", "topup": dict(row)}
-        if status == "rejected":
-            return {"outcome": "already_rejected", "topup": dict(row)}
-
-        upd = conn.execute(
-            """
-            UPDATE topups
-            SET status = 'rejected', admin_id = ?, admin_comment = ?, updated_at = ?, decided_at = ?
-            WHERE id = ? AND status = 'pending'
-            """,
-            (int(admin_id), (comment or "Отклонено администратором")[:300], now, now, int(topup_id)),
-        )
-        if upd.rowcount != 1:
-            latest = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-            return {"outcome": "already_processed", "topup": dict(latest)}
-
-        conn.execute(
-            """
-            INSERT INTO admin_audit_log (admin_id, action, target_type, target_id, details, created_at)
-            VALUES (?, 'reject_topup', 'topup', ?, ?, ?)
-            """,
-            (int(admin_id), str(topup_id), comment or "Отклонено администратором", now),
-        )
-        updated = conn.execute("SELECT * FROM topups WHERE id = ?", (int(topup_id),)).fetchone()
-
-    uid = int(row["user_id"])
-    amt = int(row["amount_uzs"])
-    reason_txt = f"\nПричина: {h(comment)}" if comment else ""
-    notify(
-        uid,
-        f"❌ <b>Заявка #{topup_id} отклонена</b>\n"
-        f"Сумма: <b>{uzs(amt)}</b>. Баланс не изменён.{reason_txt}",
-    )
-    return {"outcome": "rejected", "topup": dict(updated)}
-
-
-# --- Проверка и запись Telegram Stars платежей ---
-def send_order_invoice(chat_id: int, order: dict[str, Any]) -> None:
-    total = int(order.get("total", 0))
-    if total <= 0:
-        raise ShopError("Некорректная сумма заказа")
-    prices = [types.LabeledPrice(label=f"Заказ #{order['id']}", amount=total)]
-    bot.send_invoice(
-        chat_id=chat_id,
-        title=f"Заказ #{order['id']} — {config.BRAND}",
-        description=f"Получатель: {order.get('recipient', '')}",
-        invoice_payload=f"order:{order['id']}:{order['user_id']}",
-        provider_token="",
-        currency="XTR",
-        prices=prices,
-    )
-
-
-def handle_pre_checkout(query: types.PreCheckoutQuery) -> None:
-    try:
-        parts = (query.invoice_payload or "").split(":")
-        order_id = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-        expected_uid = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 0
-        order = db.q_one("SELECT * FROM legacy_orders WHERE id = ?", (order_id,))
-        if (
-            not order
-            or int(order["user_id"]) != int(query.from_user.id)
-            or (expected_uid and int(order["user_id"]) != expected_uid)
-            or order["currency"] != "XTR"
-            or query.currency != "XTR"
-            or int(order["total_amount"]) != int(query.total_amount)
-            or order["status"] != "pending"
-        ):
-            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Заказ недействителен или уже оплачен")
-            return
-        bot.answer_pre_checkout_query(query.id, ok=True)
-    except Exception:  # noqa: BLE001
-        try:
-            bot.answer_pre_checkout_query(query.id, ok=False, error_message="Ошибка проверки платежа")
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def record_payment(
-    user_id: int,
-    currency: str,
-    total_amount: int,
-    invoice_payload: str,
-    telegram_charge_id: str,
-    provider_charge_id: str = "",
-) -> dict[str, Any]:
-    now = int(time.time())
-    charge_id = (telegram_charge_id or "").strip()
-    if not charge_id:
-        return {"result": "review", "problem": "missing_charge_id", "order": None, "payment": None}
-
-    order_id = 0
-    payload_uid = 0
-    parts = (invoice_payload or "").split(":")
-    if len(parts) >= 2 and parts[1].isdigit():
-        order_id = int(parts[1])
-    if len(parts) >= 3 and parts[2].isdigit():
-        payload_uid = int(parts[2])
-
-    with db.tx() as conn:
-        dup = conn.execute(
-            "SELECT id FROM payments WHERE telegram_charge_id = ?",
-            (charge_id,),
-        ).fetchone()
-        if dup:
-            return {"result": "duplicate"}
-
-        order_row = conn.execute("SELECT * FROM legacy_orders WHERE id = ?", (order_id,)).fetchone()
-        problem = None
-        if not order_row:
-            problem = "order_not_found"
-        elif int(order_row["user_id"]) != int(user_id):
-            problem = "user_mismatch"
-        elif payload_uid and int(user_id) != payload_uid:
-            problem = "payload_user_mismatch"
-        elif currency != "XTR":
-            problem = f"currency_mismatch:{currency}"
-        elif int(order_row["total_amount"]) != int(total_amount):
-            problem = f"amount_mismatch:{total_amount}!={order_row['total_amount']}"
-        elif order_row["status"] != "pending":
-            problem = f"invalid_order_status:{order_row['status']}"
-
-        status = "paid" if not problem else "review"
-        cur = conn.execute(
-            """
-            INSERT INTO payments (
-                order_id, user_id, currency, amount, payload,
-                telegram_charge_id, provider_charge_id, status, problem, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SET receipt_file_id = ?,
+                receipt_note = ?,
+                updated_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'pending'
             """,
             (
-                order_id,
-                int(user_id),
-                currency,
-                int(total_amount),
-                invoice_payload,
-                charge_id,
-                provider_charge_id,
-                status,
-                problem,
-                now,
+                file_id,
+                note,
+                db.now(),
+                topup_id,
+                user_id,
             ),
         )
-        pay_id = int(cur.lastrowid)
-        if not problem and order_row:
-            conn.execute(
-                "UPDATE legacy_orders SET status = 'paid', updated_at = ? WHERE id = ? AND status = 'pending'",
-                (now, order_id),
+
+        return get_topup(topup_id)
+
+
+# --------------------------------------------------
+# НАЧИСЛЕНИЕ ДЕНЕГ
+# --------------------------------------------------
+
+def approve_topup(
+    topup_id: int,
+    admin_id: int,
+    admin_comment: str = "",
+) -> dict:
+    """
+    Подтверждает пополнение и начисляет UZS один раз.
+
+    Повторное подтверждение не создаёт повторного начисления.
+    """
+
+    topup_id = _positive(topup_id, "ID пополнения")
+    admin_id = _uid(admin_id)
+
+    timestamp = db.now()
+
+    with db.transaction():
+        topup = db.fetchone(
+            "SELECT * FROM topups WHERE id = ?",
+            (topup_id,),
+        )
+
+        if not topup:
+            raise ValueError("Заявка не найдена")
+
+        if topup["status"] == "approved":
+            raise ValueError("Заявка уже подтверждена")
+
+        if topup["status"] != "pending":
+            raise ValueError("Заявка не ожидает подтверждения")
+
+        amount = int(topup["amount_uzs"])
+
+        if amount <= 0:
+            raise ValueError("Некорректная сумма пополнения")
+
+        user_id = int(topup["user_id"])
+
+        wallet = db.fetchone(
+            "SELECT * FROM wallets WHERE user_id = ?",
+            (user_id,),
+        )
+
+        if not wallet:
+            raise ValueError("Кошелёк пользователя не найден")
+
+        new_balance = int(wallet["balance_uzs"]) + amount
+        new_bonus = int(wallet["bonus_uzs"])
+
+        cursor = db.execute(
+            """
+            UPDATE topups
+            SET status = 'approved',
+                admin_id = ?,
+                admin_comment = ?,
+                confirmed_at = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (
+                admin_id,
+                str(admin_comment),
+                timestamp,
+                timestamp,
+                topup_id,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise ValueError("Заявка уже была обработана")
+
+        db.execute(
+            """
+            UPDATE wallets
+            SET balance_uzs = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (new_balance, timestamp, user_id),
+        )
+
+        db.execute(
+            """
+            INSERT INTO wallet_transactions(
+                user_id,
+                transaction_type,
+                amount_uzs,
+                balance_delta,
+                bonus_delta,
+                balance_after,
+                bonus_after,
+                reference_type,
+                reference_id,
+                description,
+                created_at
+            )
+            VALUES (
+                ?, 'topup', ?, ?, 0, ?, ?,
+                'topup', ?, ?, ?
+            )
+            """,
+            (
+                user_id,
+                amount,
+                amount,
+                new_balance,
+                new_bonus,
+                str(topup_id),
+                f"Пополнение №{topup_id}",
+                timestamp,
+            ),
+        )
+
+        db.record_admin_action(
+            admin_id,
+            "approve_topup",
+            "topup",
+            str(topup_id),
+            {
+                "user_id": user_id,
+                "amount_uzs": amount,
+                "comment": admin_comment,
+            },
+        )
+
+        return get_topup(topup_id)
+
+
+def reject_topup(
+    topup_id: int,
+    admin_id: int,
+    reason: str = "",
+) -> dict:
+    """
+    Отклоняет заявку без изменения баланса.
+    """
+
+    topup_id = _positive(topup_id, "ID пополнения")
+    admin_id = _uid(admin_id)
+
+    with db.transaction():
+        topup = db.fetchone(
+            "SELECT * FROM topups WHERE id = ?",
+            (topup_id,),
+        )
+
+        if not topup:
+            raise ValueError("Заявка не найдена")
+
+        if topup["status"] != "pending":
+            raise ValueError("Заявка уже обработана")
+
+        cursor = db.execute(
+            """
+            UPDATE topups
+            SET status = 'rejected',
+                admin_id = ?,
+                admin_comment = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (
+                admin_id,
+                str(reason),
+                db.now(),
+                topup_id,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise ValueError("Заявка уже была обработана")
+
+        db.record_admin_action(
+            admin_id,
+            "reject_topup",
+            "topup",
+            str(topup_id),
+            {"reason": reason},
+        )
+
+        return get_topup(topup_id)
+
+
+# --------------------------------------------------
+# TELEGRAM STARS
+# --------------------------------------------------
+
+def _ensure_xtr_orders_table() -> None:
+    """
+    Отдельная таблица для заказов, оплаченных Telegram Stars.
+    """
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS xtr_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            product_title TEXT NOT NULL,
+            amount_xtr INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'XTR',
+            telegram_charge_id TEXT NOT NULL UNIQUE,
+            payment_id INTEGER NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'paid',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_xtr_orders_user
+        ON xtr_orders(user_id, created_at)
+        """
+    )
+
+
+def create_xtr_invoice(
+    bot,
+    chat_id: int,
+    user_id: int,
+    product_id: int,
+):
+    """
+    Создаёт Telegram Stars invoice.
+
+    Оплата доступна только товарам категории other
+    с fulfillment_mode='xtr'.
+    """
+
+    user_id = _uid(user_id)
+    product_id = _positive(product_id, "ID товара")
+
+    product = shop.get_product(product_id)
+
+    if not product:
+        raise ValueError("Товар не найден или отключён")
+
+    if product.get("category_slug") != "other":
+        raise ValueError(
+            "Telegram Stars разрешены только в категории «Другие товары»"
+        )
+
+    if product.get("fulfillment_mode") != "xtr":
+        raise ValueError("Этот товар не продаётся за Telegram Stars")
+
+    amount = int(product.get("price_xtr") or 0)
+
+    if amount <= 0:
+        raise ValueError("Некорректная цена товара в Stars")
+
+    _ensure_xtr_orders_table()
+
+    nonce = secrets.token_urlsafe(18)
+    payload = f"gss:xtr:{user_id}:{product_id}:{nonce}"
+
+    timestamp = db.now()
+
+    with db.transaction():
+        payment_cursor = db.execute(
+            """
+            INSERT INTO payments(
+                user_id,
+                order_id,
+                payment_type,
+                provider,
+                amount,
+                currency,
+                status,
+                payload,
+                created_at,
+                updated_at
+            )
+            VALUES (?, NULL, 'product', 'telegram_stars',
+                    ?, 'XTR', 'pending', ?, ?, ?)
+            """,
+            (
+                user_id,
+                amount,
+                payload,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+        payment_id = payment_cursor.lastrowid
+
+    try:
+        import telebot
+
+        prices = [
+            telebot.types.LabeledPrice(
+                label=str(product["title"])[:32],
+                amount=amount,
+            )
+        ]
+
+        bot.send_invoice(
+            chat_id=chat_id,
+            title=str(product["title"])[:32],
+            description=str(
+                product.get("description") or product["title"]
+            )[:255],
+            invoice_payload=payload,
+            provider_token="",
+            currency="XTR",
+            prices=prices,
+        )
+
+    except Exception:
+        with db.transaction():
+            db.execute(
+                """
+                UPDATE payments
+                SET status = 'failed',
+                    updated_at = ?
+                WHERE id = ? AND status = 'pending'
+                """,
+                (db.now(), payment_id),
+            )
+        raise
+
+    return {
+        "payment_id": payment_id,
+        "payload": payload,
+        "amount_xtr": amount,
+        "currency": "XTR",
+    }
+
+
+def validate_xtr_pre_checkout(
+    user_id: int,
+    payload: str,
+    currency: str,
+    total_amount: int,
+) -> tuple[bool, str]:
+    """
+    Проверяет данные Telegram pre_checkout_query.
+    """
+
+    user_id = _uid(user_id)
+
+    if currency != "XTR":
+        return False, "Неверная валюта платежа"
+
+    try:
+        total_amount = int(total_amount)
+    except (TypeError, ValueError):
+        return False, "Неверная сумма платежа"
+
+    if total_amount <= 0:
+        return False, "Неверная сумма платежа"
+
+    payment = db.fetchone(
+        """
+        SELECT *
+        FROM payments
+        WHERE payload = ?
+          AND user_id = ?
+          AND provider = 'telegram_stars'
+          AND currency = 'XTR'
+          AND status = 'pending'
+        """,
+        (str(payload), user_id),
+    )
+
+    if not payment:
+        return False, "Платёж не найден или уже обработан"
+
+    if int(payment["amount"]) != total_amount:
+        return False, "Сумма платежа не совпадает"
+
+    parts = str(payload).split(":")
+
+    if len(parts) != 5 or parts[0] != "gss" or parts[1] != "xtr":
+        return False, "Некорректные данные платежа"
+
+    try:
+        payload_user_id = int(parts[2])
+        product_id = int(parts[3])
+    except (TypeError, ValueError):
+        return False, "Некорректные данные платежа"
+
+    if payload_user_id != user_id:
+        return False, "Пользователь не совпадает"
+
+    product = shop.get_product(product_id)
+
+    if not product:
+        return False, "Товар больше недоступен"
+
+    if product.get("category_slug") != "other":
+        return False, "Неверная категория товара"
+
+    if product.get("fulfillment_mode") != "xtr":
+        return False, "Неверный способ оплаты"
+
+    if int(product.get("price_xtr") or 0) != total_amount:
+        return False, "Цена товара изменилась"
+
+    return True, ""
+
+
+def process_xtr_success(
+    user_id: int,
+    payload: str,
+    currency: str,
+    total_amount: int,
+    telegram_charge_id: str,
+) -> dict:
+    """
+    Обрабатывает успешный платёж Telegram Stars.
+
+    Проверяет пользователя, товар, сумму, валюту,
+    уникальность Telegram charge ID и статус платежа.
+    """
+
+    user_id = _uid(user_id)
+    total_amount = _positive(total_amount, "Сумма")
+    telegram_charge_id = str(telegram_charge_id or "").strip()
+
+    if currency != "XTR":
+        raise ValueError("Неверная валюта платежа")
+
+    if not telegram_charge_id:
+        raise ValueError("Отсутствует ID платежа Telegram")
+
+    valid, error = validate_xtr_pre_checkout(
+        user_id,
+        payload,
+        currency,
+        total_amount,
+    )
+
+    if not valid:
+        raise ValueError(error)
+
+    parts = str(payload).split(":")
+    product_id = int(parts[3])
+
+    _ensure_xtr_orders_table()
+
+    timestamp = db.now()
+
+    with db.transaction():
+        payment = db.fetchone(
+            """
+            SELECT *
+            FROM payments
+            WHERE payload = ?
+              AND user_id = ?
+              AND provider = 'telegram_stars'
+            """,
+            (payload, user_id),
+        )
+
+        if not payment:
+            raise ValueError("Платёж не найден")
+
+        if payment["status"] == "paid":
+            existing = db.fetchone(
+                """
+                SELECT *
+                FROM xtr_orders
+                WHERE telegram_charge_id = ?
+                """,
+                (telegram_charge_id,),
             )
 
-    order_full = db.q_one(
-        "SELECT id, user_id, recipient, total_amount AS total, currency, status FROM legacy_orders WHERE id = ?",
-        (order_id,),
-    )
-    if order_full:
-        order_full["items"] = db.q_all(
-            "SELECT title, price, qty FROM legacy_order_items WHERE order_id = ?",
-            (order_id,),
+            if existing:
+                return _dict(existing)
+
+            raise ValueError("Платёж уже обработан")
+
+        if payment["status"] != "pending":
+            raise ValueError("Платёж больше не ожидает подтверждения")
+
+        if int(payment["amount"]) != total_amount:
+            raise ValueError("Сумма платежа не совпадает")
+
+        product = db.fetchone(
+            """
+            SELECT p.*, c.slug AS category_slug
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.id = ? AND p.active = 1
+            """,
+            (product_id,),
         )
-    pay_full = db.q_one("SELECT * FROM payments WHERE id = ?", (pay_id,))
-    return {
-        "result": "paid" if not problem else "review",
-        "problem": problem,
-        "order": order_full,
-        "payment": pay_full,
-    }
+
+        if not product:
+            raise ValueError("Товар больше недоступен")
+
+        if product["category_slug"] != "other":
+            raise ValueError("Недопустимая категория товара")
+
+        if product["fulfillment_mode"] != "xtr":
+            raise ValueError("Недопустимый способ оплаты")
+
+        if int(product["price_xtr"]) != total_amount:
+            raise ValueError("Цена товара изменилась")
+
+        if product["stock"] is not None:
+            if int(product["stock"]) < 1:
+                raise ValueError("Товар закончился")
+
+            stock_cursor = db.execute(
+                """
+                UPDATE products
+                SET stock = stock - 1,
+                    updated_at = ?
+                WHERE id = ? AND stock >= 1
+                """,
+                (timestamp, product_id),
+            )
+
+            if stock_cursor.rowcount != 1:
+                raise ValueError("Товар закончился")
+
+        cursor = db.execute(
+            """
+            INSERT INTO xtr_orders(
+                user_id,
+                product_id,
+                product_title,
+                amount_xtr,
+                currency,
+                telegram_charge_id,
+                payment_id,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, 'XTR', ?, ?, 'paid', ?)
+            """,
+            (
+                user_id,
+                product_id,
+                product["title"],
+                total_amount,
+                telegram_charge_id,
+                payment["id"],
+                timestamp,
+            ),
+        )
+
+        order_id = cursor.lastrowid
+
+        update_cursor = db.execute(
+            """
+            UPDATE payments
+            SET status = 'paid',
+                telegram_charge_id = ?,
+                provider_payment_id = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (
+                telegram_charge_id,
+                telegram_charge_id,
+                timestamp,
+                payment["id"],
+            ),
+        )
+
+        if update_cursor.rowcount != 1:
+            raise ValueError("Платёж уже был обработан")
+
+        return _dict(
+            db.fetchone(
+                "SELECT * FROM xtr_orders WHERE id = ?",
+                (order_id,),
+            )
+        )
+
+
+def get_user_xtr_orders(
+    user_id: int,
+    limit: int = 30,
+) -> list[dict]:
+
+    user_id = _uid(user_id)
+    limit = max(1, min(int(limit), 100))
+
+    _ensure_xtr_orders_table()
+
+    rows = db.fetchall(
+        """
+        SELECT *
+        FROM xtr_orders
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+
+    return [_dict(row) for row in rows]
+
+
+# --------------------------------------------------
+# СОВМЕСТИМОСТЬ С ДРУГИМИ МОДУЛЯМИ
+# --------------------------------------------------
+
+new_topup = create_topup
+submit_topup_receipt = attach_topup_receipt
+confirm_topup = approve_topup
+decline_topup = reject_topup
+pending_topups = get_pending_topups
+create_stars_invoice = create_xtr_invoice
+check_pre_checkout = validate_xtr_pre_checkout
+successful_stars_payment = process_xtr_success
