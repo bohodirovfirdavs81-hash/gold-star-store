@@ -1,638 +1,752 @@
+# -*- coding: utf-8 -*-
+"""
+Gold Star Store — каталог, корзина и оформление заказов.
+"""
 
-import hashlib
-import time
-import uuid
+import sqlite3
 from typing import Any
 
 import database as db
-from utils import normalize_recipient
 
 
-MAX_CART_QTY = 50
-MAX_PAGE_SIZE = 100
-MAX_IDEMPOTENCY_KEY_LENGTH = 200
+MAX_BONUS_PERCENT = 50
+MAX_PRODUCT_QTY = 99
 
 
-class ShopError(Exception):
-    pass
+def _dict(row):
+    return dict(row) if row is not None else None
 
 
-def _page(limit: int, offset: int = 0):
-    return (
-        max(1, min(int(limit), MAX_PAGE_SIZE)),
-        max(0, int(offset)),
+def _user_id(value: Any) -> int:
+    result = int(value or 0)
+    if result <= 0:
+        raise ValueError("Некорректный ID пользователя")
+    return result
+
+
+def _positive_int(value: Any, name: str) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Некорректное значение: {name}")
+
+    if result <= 0:
+        raise ValueError(f"{name} должен быть больше нуля")
+
+    return result
+
+
+def _ensure_user(user_id: int) -> None:
+    user = db.get_user(user_id)
+
+    if not user:
+        raise ValueError("Пользователь не найден")
+
+
+# --------------------------------------------------
+# КАТЕГОРИИ
+# --------------------------------------------------
+
+def get_categories(active_only: bool = True) -> list[dict]:
+    sql = "SELECT * FROM categories"
+
+    if active_only:
+        sql += " WHERE active = 1"
+
+    sql += " ORDER BY sort_order ASC, id ASC"
+
+    return [_dict(row) for row in db.fetchall(sql)]
+
+
+def get_category(slug: str):
+    if not slug:
+        return None
+
+    return _dict(
+        db.fetchone(
+            "SELECT * FROM categories WHERE slug = ? AND active = 1",
+            (str(slug),),
+        )
     )
 
 
-def list_categories() -> list[dict[str, Any]]:
-    return db.q_all(
-        """
-        SELECT id, slug, title, description, sort_order, is_active
-        FROM categories
-        WHERE is_active = 1
-        ORDER BY sort_order, id
-        """
-    )
+def create_category(
+    slug: str,
+    title: str,
+    description: str = "",
+    sort_order: int = 0,
+) -> int:
+    slug = str(slug).strip().lower()
+    title = str(title).strip()
+
+    if not slug or not title:
+        raise ValueError("Укажите название и идентификатор категории")
+
+    with db.transaction():
+        cursor = db.execute(
+            """
+            INSERT INTO categories(
+                slug, title, description, sort_order,
+                active, created_at
+            )
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (slug, title, description, int(sort_order), db.now()),
+        )
+
+        return cursor.lastrowid
 
 
-def get_category(category_id: int):
-    return db.q_one(
-        "SELECT * FROM categories WHERE id = ?",
-        (int(category_id),),
-    )
+# --------------------------------------------------
+# ТОВАРЫ
+# --------------------------------------------------
 
-
-def list_products(
-    category_slug: str | None = None,
-    limit: int = MAX_PAGE_SIZE,
-    offset: int = 0,
-) -> list[dict[str, Any]]:
-    limit, offset = _page(limit, offset)
+def get_product(product_id: int, active_only: bool = True):
+    product_id = _positive_int(product_id, "ID товара")
 
     sql = """
-        SELECT p.id, p.category_id, p.sku, p.title,
-               p.description, p.price_uzs, p.fulfillment_mode,
-               p.is_active, p.sort_order,
-               c.slug AS category_slug,
-               c.title AS category_title
+        SELECT
+            p.*,
+            c.slug AS category_slug,
+            c.title AS category_title
         FROM products p
-        JOIN categories c ON c.id = p.category_id
-        WHERE p.is_active = 1 AND c.is_active = 1
+        LEFT JOIN categories c ON c.id = p.category_id
+        WHERE p.id = ?
     """
+
+    if active_only:
+        sql += " AND p.active = 1"
+
+    return _dict(db.fetchone(sql, (product_id,)))
+
+
+def get_product_by_sku(sku: str):
+    if not sku:
+        return None
+
+    return _dict(
+        db.fetchone(
+            """
+            SELECT *
+            FROM products
+            WHERE sku = ? AND active = 1
+            """,
+            (str(sku).strip(),),
+        )
+    )
+
+
+def get_products(
+    category_slug: str | None = None,
+    active_only: bool = True,
+) -> list[dict]:
+
+    sql = """
+        SELECT
+            p.*,
+            c.slug AS category_slug,
+            c.title AS category_title
+        FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        WHERE 1 = 1
+    """
+
     params = []
+
+    if active_only:
+        sql += " AND p.active = 1"
 
     if category_slug:
         sql += " AND c.slug = ?"
-        params.append(category_slug)
+        params.append(str(category_slug))
 
-    sql += " ORDER BY p.sort_order, p.id LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
+    sql += " ORDER BY p.sort_order ASC, p.id DESC"
 
-    return db.q_all(sql, tuple(params))
+    return [
+        _dict(row)
+        for row in db.fetchall(sql, tuple(params))
+    ]
 
 
-def get_product(product_id: int):
-    return db.q_one(
-        """
-        SELECT p.*, c.slug AS category_slug,
-               c.title AS category_title
-        FROM products p
-        JOIN categories c ON c.id = p.category_id
-        WHERE p.id = ?
-        """,
-        (int(product_id),),
+def create_product(
+    category_slug: str,
+    title: str,
+    description: str,
+    price_uzs: int,
+    fulfillment_mode: str = "manual",
+    price_xtr: int = 0,
+    sku: str | None = None,
+    image_url: str | None = None,
+    bonus_eligible: bool = True,
+) -> int:
+
+    title = str(title).strip()
+    category_slug = str(category_slug).strip().lower()
+
+    price_uzs = int(price_uzs)
+    price_xtr = int(price_xtr)
+
+    allowed_modes = {"manual", "wallet", "xtr", "request", "info"}
+
+    if not title:
+        raise ValueError("Название товара не может быть пустым")
+
+    if price_uzs < 0 or price_xtr < 0:
+        raise ValueError("Цена не может быть отрицательной")
+
+    if fulfillment_mode not in allowed_modes:
+        raise ValueError("Неизвестный способ выполнения заказа")
+
+    category = db.fetchone(
+        "SELECT id FROM categories WHERE slug = ?",
+        (category_slug,),
     )
 
+    if not category:
+        raise ValueError("Категория не найдена")
 
-def get_cart(user_id: int) -> list[dict[str, Any]]:
-    return db.q_all(
+    if fulfillment_mode == "xtr" and category_slug != "other":
+        raise ValueError(
+            "Оплата Telegram Stars разрешена только в категории «Другие товары»"
+        )
+
+    if fulfillment_mode == "xtr" and price_xtr <= 0:
+        raise ValueError("Для товара XTR необходимо указать цену в Stars")
+
+    with db.transaction():
+        cursor = db.execute(
+            """
+            INSERT INTO products(
+                category_id, sku, title, description,
+                price_uzs, price_xtr, fulfillment_mode,
+                active, bonus_eligible, image_url,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            """,
+            (
+                category["id"],
+                sku,
+                title,
+                description or "",
+                price_uzs,
+                price_xtr,
+                fulfillment_mode,
+                int(bool(bonus_eligible)),
+                image_url,
+                db.now(),
+                db.now(),
+            ),
+        )
+
+        return cursor.lastrowid
+
+
+def set_product_active(product_id: int, active: bool) -> bool:
+    product_id = _positive_int(product_id, "ID товара")
+
+    with db.transaction():
+        cursor = db.execute(
+            """
+            UPDATE products
+            SET active = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (int(bool(active)), db.now(), product_id),
+        )
+
+        return cursor.rowcount > 0
+
+
+# --------------------------------------------------
+# КОРЗИНА
+# --------------------------------------------------
+
+def add_to_cart(
+    user_id: int,
+    product_id: int,
+    qty: int = 1,
+) -> dict:
+
+    user_id = _user_id(user_id)
+    product_id = _positive_int(product_id, "ID товара")
+    qty = _positive_int(qty, "Количество")
+
+    if qty > MAX_PRODUCT_QTY:
+        raise ValueError("Слишком большое количество товара")
+
+    _ensure_user(user_id)
+
+    product = get_product(product_id)
+
+    if not product:
+        raise ValueError("Товар не найден или отключён")
+
+    if product["fulfillment_mode"] in {"info", "request", "xtr"}:
+        raise ValueError(
+            "Этот товар нельзя добавить в обычную корзину"
+        )
+
+    if product["price_uzs"] <= 0:
+        raise ValueError("У товара не указана корректная цена")
+
+    if product["stock"] is not None and product["stock"] < qty:
+        raise ValueError("Недостаточно товара на складе")
+
+    with db.transaction():
+        row = db.fetchone(
+            """
+            SELECT id, qty
+            FROM cart_items
+            WHERE user_id = ? AND product_id = ?
+            """,
+            (user_id, product_id),
+        )
+
+        new_qty = qty
+
+        if row:
+            new_qty += int(row["qty"])
+
+        if new_qty > MAX_PRODUCT_QTY:
+            raise ValueError("Превышено максимальное количество товара")
+
+        if product["stock"] is not None and product["stock"] < new_qty:
+            raise ValueError("Недостаточно товара на складе")
+
+        timestamp = db.now()
+
+        db.execute(
+            """
+            INSERT INTO cart_items(
+                user_id, product_id, qty, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, product_id) DO UPDATE SET
+                qty = excluded.qty,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, product_id, new_qty, timestamp, timestamp),
+        )
+
+    return get_cart(user_id)
+
+
+def set_cart_quantity(
+    user_id: int,
+    product_id: int,
+    qty: int,
+) -> dict:
+
+    user_id = _user_id(user_id)
+    product_id = _positive_int(product_id, "ID товара")
+    qty = _positive_int(qty, "Количество")
+
+    if qty > MAX_PRODUCT_QTY:
+        raise ValueError("Слишком большое количество")
+
+    product = get_product(product_id)
+
+    if not product:
+        raise ValueError("Товар недоступен")
+
+    if product["stock"] is not None and product["stock"] < qty:
+        raise ValueError("Недостаточно товара на складе")
+
+    with db.transaction():
+        cursor = db.execute(
+            """
+            UPDATE cart_items
+            SET qty = ?, updated_at = ?
+            WHERE user_id = ? AND product_id = ?
+            """,
+            (qty, db.now(), user_id, product_id),
+        )
+
+        if cursor.rowcount == 0:
+            raise ValueError("Товар отсутствует в корзине")
+
+    return get_cart(user_id)
+
+
+def remove_from_cart(user_id: int, product_id: int) -> bool:
+    user_id = _user_id(user_id)
+    product_id = _positive_int(product_id, "ID товара")
+
+    with db.transaction():
+        cursor = db.execute(
+            """
+            DELETE FROM cart_items
+            WHERE user_id = ? AND product_id = ?
+            """,
+            (user_id, product_id),
+        )
+
+        return cursor.rowcount > 0
+
+
+def clear_cart(user_id: int) -> None:
+    user_id = _user_id(user_id)
+
+    with db.transaction():
+        db.execute(
+            "DELETE FROM cart_items WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def get_cart(user_id: int) -> dict:
+    user_id = _user_id(user_id)
+
+    rows = db.fetchall(
         """
-        SELECT ci.product_id, ci.qty,
-               p.title, p.price_uzs,
-               p.fulfillment_mode,
-               p.is_active
+        SELECT
+            ci.id AS cart_id,
+            ci.qty,
+            p.id AS product_id,
+            p.title,
+            p.description,
+            p.price_uzs,
+            p.fulfillment_mode,
+            p.stock,
+            p.bonus_eligible,
+            p.active
         FROM cart_items ci
         JOIN products p ON p.id = ci.product_id
         WHERE ci.user_id = ?
-        ORDER BY ci.rowid DESC
+        ORDER BY ci.id DESC
         """,
-        (int(user_id),),
+        (user_id,),
     )
 
+    items = []
+    total = 0
 
-def cart_add(user_id: int, product_id: int, qty: int = 1):
-    uid = int(user_id)
-    pid = int(product_id)
-    quantity = int(qty)
+    for row in rows:
+        item = _dict(row)
 
-    if quantity < 1 or quantity > MAX_CART_QTY:
-        raise ShopError("Некорректное количество товара")
+        item_total = int(item["price_uzs"]) * int(item["qty"])
+        item["total_uzs"] = item_total
 
-    product = get_product(pid)
-    if not product or not product["is_active"]:
-        raise ShopError("Товар недоступен")
+        items.append(item)
+        total += item_total
 
-    with db.tx() as conn:
-        row = conn.execute(
-            """
-            SELECT qty FROM cart_items
-            WHERE user_id = ? AND product_id = ?
-            """,
-            (uid, pid),
-        ).fetchone()
-
-        new_qty = quantity + (int(row["qty"]) if row else 0)
-
-        if new_qty > MAX_CART_QTY:
-            raise ShopError("Превышено максимальное количество")
-
-        conn.execute(
-            """
-            INSERT INTO cart_items (user_id, product_id, qty)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, product_id)
-            DO UPDATE SET qty = excluded.qty
-            """,
-            (uid, pid, new_qty),
-        )
-
-    return get_cart(uid)
+    return {
+        "items": items,
+        "count": sum(int(item["qty"]) for item in items),
+        "total_uzs": total,
+    }
 
 
-def cart_set_qty(user_id: int, product_id: int, qty: int):
-    uid = int(user_id)
-    pid = int(product_id)
-    quantity = int(qty)
+# --------------------------------------------------
+# РАСЧЁТ ОПЛАТЫ
+# --------------------------------------------------
 
-    if quantity < 0 or quantity > MAX_CART_QTY:
-        raise ShopError("Некорректное количество")
+def calculate_payment(
+    total_uzs: int,
+    balance_uzs: int,
+    bonus_uzs: int,
+    bonus_eligible: bool = True,
+) -> dict:
 
-    with db.tx() as conn:
-        if quantity == 0:
-            conn.execute(
-                """
-                DELETE FROM cart_items
-                WHERE user_id = ? AND product_id = ?
-                """,
-                (uid, pid),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO cart_items (user_id, product_id, qty)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id, product_id)
-                DO UPDATE SET qty = excluded.qty
-                """,
-                (uid, pid, quantity),
-            )
+    total = max(0, int(total_uzs))
+    balance = max(0, int(balance_uzs))
+    bonus = max(0, int(bonus_uzs))
 
-    return get_cart(uid)
+    if total == 0:
+        return {
+            "total_uzs": 0,
+            "bonus_used_uzs": 0,
+            "balance_used_uzs": 0,
+            "remaining_uzs": 0,
+        }
+
+    bonus_limit = (
+        total * MAX_BONUS_PERCENT // 100
+        if bonus_eligible
+        else 0
+    )
+
+    bonus_used = min(bonus, bonus_limit)
+
+    remaining = total - bonus_used
+    balance_used = min(balance, remaining)
+
+    return {
+        "total_uzs": total,
+        "bonus_used_uzs": bonus_used,
+        "balance_used_uzs": balance_used,
+        "remaining_uzs": total - bonus_used - balance_used,
+    }
 
 
-def cart_clear(user_id: int):
-    with db.tx() as conn:
-        conn.execute(
-            "DELETE FROM cart_items WHERE user_id = ?",
-            (int(user_id),),
-        )
-
-
-def _normalize_idempotency_key(user_id: int, key: str) -> str:
-    raw = str(key or "").strip()
-
-    if not raw:
-        raw = uuid.uuid4().hex
-
-    if len(raw) > MAX_IDEMPOTENCY_KEY_LENGTH:
-        raw = hashlib.sha256(raw.encode()).hexdigest()
-
-    return f"u{int(user_id)}_{raw}"
-
+# --------------------------------------------------
+# ОФОРМЛЕНИЕ ЗАКАЗА
+# --------------------------------------------------
 
 def create_wallet_order(
     user_id: int,
     product_id: int,
-    qty: int,
-    recipient: str,
-    idempotency_key: str = "",
-) -> dict[str, Any]:
-    uid = int(user_id)
-    pid = int(product_id)
-    quantity = int(qty)
+    qty: int = 1,
+    recipient: str = "",
+    idempotency_key: str | None = None,
+) -> dict:
 
-    if uid <= 0 or pid <= 0:
-        raise ShopError("Некорректные данные заказа")
+    user_id = _user_id(user_id)
+    product_id = _positive_int(product_id, "ID товара")
+    qty = _positive_int(qty, "Количество")
 
-    if quantity < 1 or quantity > MAX_CART_QTY:
-        raise ShopError("Некорректное количество товара")
+    if qty > MAX_PRODUCT_QTY:
+        raise ValueError("Слишком большое количество товара")
 
-    try:
-        recipient = normalize_recipient(recipient)
-    except ValueError as exc:
-        raise ShopError(str(exc)) from exc
+    recipient = str(recipient or "").strip()
 
-    if not recipient:
-        raise ShopError("Укажите получателя")
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip()
 
-    order_uid = _normalize_idempotency_key(uid, idempotency_key)
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise ValueError("Некорректный ключ заказа")
 
-    with db.tx() as conn:
-        existing = conn.execute(
-            "SELECT * FROM wallet_orders WHERE order_uid = ?",
-            (order_uid,),
-        ).fetchone()
+    timestamp = db.now()
 
-        if existing:
-            if (
-                int(existing["user_id"]) != uid
-                or int(existing["product_id"]) != pid
-                or int(existing["qty"]) != quantity
-                or existing["recipient"] != recipient
-            ):
-                raise ShopError("Ключ заказа уже использован с другими данными")
-            return dict(existing)
+    with db.transaction():
+        _ensure_user(user_id)
 
-        product = conn.execute(
+        if idempotency_key:
+            existing = db.fetchone(
+                """
+                SELECT *
+                FROM wallet_orders
+                WHERE user_id = ? AND idempotency_key = ?
+                """,
+                (user_id, idempotency_key),
+            )
+
+            if existing:
+                return _dict(existing)
+
+        product = db.fetchone(
             """
-            SELECT p.*, c.slug AS category_slug
-            FROM products p
-            JOIN categories c ON c.id = p.category_id
-            WHERE p.id = ? AND p.is_active = 1 AND c.is_active = 1
+            SELECT *
+            FROM products
+            WHERE id = ? AND active = 1
             """,
-            (pid,),
-        ).fetchone()
+            (product_id,),
+        )
 
         if not product:
-            raise ShopError("Товар не найден или недоступен")
+            raise ValueError("Товар не найден или отключён")
+
+        if product["fulfillment_mode"] not in {"manual", "wallet"}:
+            raise ValueError(
+                "Этот товар нельзя оплатить через кошелёк"
+            )
 
         unit_price = int(product["price_uzs"])
-        total = unit_price * quantity
 
-        if unit_price <= 0 or total <= 0:
-            raise ShopError("Некорректная цена товара")
+        if unit_price <= 0:
+            raise ValueError("Некорректная цена товара")
 
-        wallet = conn.execute(
+        if product["stock"] is not None:
+            if int(product["stock"]) < qty:
+                raise ValueError("Недостаточно товара на складе")
+
+        total = unit_price * qty
+
+        wallet = db.fetchone(
             "SELECT * FROM wallets WHERE user_id = ?",
-            (uid,),
-        ).fetchone()
+            (user_id,),
+        )
 
         if not wallet:
-            raise ShopError("Кошелёк пользователя не найден")
+            raise ValueError("Кошелёк пользователя не найден")
 
-        balance = int(wallet["balance_uzs"])
-        bonus = int(wallet["bonus_uzs"])
+        bonus_eligible = bool(product["bonus_eligible"])
 
-        bonus_used = min(bonus, total // 2)
-        balance_used = total - bonus_used
+        payment = calculate_payment(
+            total,
+            wallet["balance_uzs"],
+            wallet["bonus_uzs"],
+            bonus_eligible,
+        )
 
-        if balance < balance_used:
-            raise ShopError("Недостаточно средств на балансе")
+        if payment["remaining_uzs"] > 0:
+            raise ValueError(
+                "Недостаточно средств. "
+                f"Не хватает {payment['remaining_uzs']} сум."
+            )
 
-        now = int(time.time())
-        new_balance = balance - balance_used
-        new_bonus = bonus - bonus_used
+        bonus_used = payment["bonus_used_uzs"]
+        balance_used = payment["balance_used_uzs"]
 
-        conn.execute(
+        new_balance = int(wallet["balance_uzs"]) - balance_used
+        new_bonus = int(wallet["bonus_uzs"]) - bonus_used
+
+        db.execute(
             """
             UPDATE wallets
-            SET balance_uzs = ?, bonus_uzs = ?, updated_at = ?
+            SET balance_uzs = ?,
+                bonus_uzs = ?,
+                updated_at = ?
             WHERE user_id = ?
             """,
-            (new_balance, new_bonus, now, uid),
+            (new_balance, new_bonus, timestamp, user_id),
         )
 
-        status = (
-            "processing"
-            if product["fulfillment_mode"] == "manual"
-            else "paid"
-        )
-
-        cur = conn.execute(
+        cursor = db.execute(
             """
-            INSERT INTO wallet_orders (
-                order_uid, user_id, product_id, sku,
-                product_title, category_slug, fulfillment_mode,
-                recipient, qty, unit_price_uzs, total_uzs,
-                paid_from_balance_uzs, paid_from_bonus_uzs,
-                status, refunded, created_at, updated_at
+            INSERT INTO wallet_orders(
+                user_id, product_id, product_title,
+                qty, recipient, unit_price_uzs,
+                total_price_uzs, bonus_used_uzs,
+                balance_used_uzs, status,
+                idempotency_key, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
             """,
             (
-                order_uid, uid, pid, product["sku"],
-                product["title"], product["category_slug"],
-                product["fulfillment_mode"], recipient,
-                quantity, unit_price, total, balance_used,
-                bonus_used, status, now, now,
+                user_id,
+                product_id,
+                product["title"],
+                qty,
+                recipient,
+                unit_price,
+                total,
+                bonus_used,
+                balance_used,
+                idempotency_key,
+                timestamp,
+                timestamp,
             ),
         )
 
-        order_id = cur.lastrowid
+        order_id = cursor.lastrowid
 
-        conn.execute(
-            """
-            INSERT INTO wallet_transactions (
-                user_id, kind, amount_uzs, bonus_delta_uzs,
-                balance_after_uzs, bonus_after_uzs,
-                ref_type, ref_id, note, created_at
+        if product["stock"] is not None:
+            db.execute(
+                """
+                UPDATE products
+                SET stock = stock - ?, updated_at = ?
+                WHERE id = ? AND stock >= ?
+                """,
+                (qty, timestamp, product_id, qty),
             )
-            VALUES (?, 'purchase', ?, ?, ?, ?, 'wallet_order', ?, ?, ?)
+
+            stock = db.fetchone(
+                "SELECT stock FROM products WHERE id = ?",
+                (product_id,),
+            )
+
+            if stock is None or stock["stock"] < 0:
+                raise ValueError("Не удалось зарезервировать товар")
+
+        db.execute(
+            """
+            INSERT INTO wallet_transactions(
+                user_id, transaction_type,
+                amount_uzs, balance_delta, bonus_delta,
+                balance_after, bonus_after,
+                reference_type, reference_id,
+                description, created_at
+            )
+            VALUES (?, 'purchase', ?, ?, ?, ?, ?, 'wallet_order', ?, ?, ?)
             """,
             (
-                uid, -balance_used, -bonus_used,
-                new_balance, new_bonus, order_id,
-                f"Покупка: {product['title']}", now,
+                user_id,
+                total,
+                -balance_used,
+                -bonus_used,
+                new_balance,
+                new_bonus,
+                str(order_id),
+                f"Оплата заказа №{order_id}",
+                timestamp,
             ),
         )
 
-        order = conn.execute(
+        order = db.fetchone(
             "SELECT * FROM wallet_orders WHERE id = ?",
             (order_id,),
-        ).fetchone()
-
-    return dict(order)
-
-
-def list_wallet_orders(user_id: int, limit: int = 30) -> list:
-    limit, _ = _page(limit)
-    return db.q_all(
-        """
-        SELECT * FROM wallet_orders
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (int(user_id), limit),
-    )
-
-
-def get_wallet_order(order_id: int):
-    return db.q_one(
-        "SELECT * FROM wallet_orders WHERE id = ?",
-        (int(order_id),),
-    )
-
-
-def refund_wallet_order_once(
-    order_id: int,
-    admin_id: int,
-    reason: str = "",
-) -> dict:
-    oid = int(order_id)
-    aid = int(admin_id)
-
-    with db.tx() as conn:
-        order = conn.execute(
-            "SELECT * FROM wallet_orders WHERE id = ?",
-            (oid,),
-        ).fetchone()
-
-        if not order:
-            raise ShopError("Заказ не найден")
-
-        if int(order["refunded"]):
-            return {"order": dict(order), "already_refunded": True}
-
-        if order["status"] == "delivered":
-            raise ShopError("Нельзя вернуть средства за уже выданный заказ")
-
-        uid = int(order["user_id"])
-        wallet = conn.execute(
-            "SELECT * FROM wallets WHERE user_id = ?",
-            (uid,),
-        ).fetchone()
-
-        if not wallet:
-            raise ShopError("Кошелёк пользователя не найден")
-
-        balance = int(wallet["balance_uzs"]) + int(order["paid_from_balance_uzs"])
-        bonus = int(wallet["bonus_uzs"]) + int(order["paid_from_bonus_uzs"])
-        now = int(time.time())
-
-        updated = conn.execute(
-            """
-            UPDATE wallet_orders
-            SET status = 'refunded',
-                refunded = 1,
-                admin_id = ?,
-                updated_at = ?
-            WHERE id = ? AND refunded = 0
-              AND status != 'delivered'
-            """,
-            (aid, now, oid),
         )
 
-        if updated.rowcount != 1:
-            raise ShopError("Заказ уже обработан")
-
-        conn.execute(
-            """
-            UPDATE wallets
-            SET balance_uzs = ?, bonus_uzs = ?, updated_at = ?
-            WHERE user_id = ?
-            """,
-            (balance, bonus, now, uid),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO wallet_transactions (
-                user_id, kind, amount_uzs, bonus_delta_uzs,
-                balance_after_uzs, bonus_after_uzs,
-                ref_type, ref_id, note, created_at
-            )
-            VALUES (?, 'refund', ?, ?, ?, ?, 'wallet_order', ?, ?, ?)
-            """,
-            (
-                uid,
-                int(order["paid_from_balance_uzs"]),
-                int(order["paid_from_bonus_uzs"]),
-                balance,
-                bonus,
-                oid,
-                str(reason or "Возврат заказа")[:300],
-                now,
-            ),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO admin_audit_log (
-                admin_id, action, target_type, target_id,
-                details, created_at
-            )
-            VALUES (?, 'refund_order', 'wallet_order', ?, ?, ?)
-            """,
-            (aid, oid, str(reason or "")[:300], now),
-        )
-
-        updated_order = conn.execute(
-            "SELECT * FROM wallet_orders WHERE id = ?",
-            (oid,),
-        ).fetchone()
-
-    return {"order": dict(updated_order), "already_refunded": False}
-
-
-def mark_wallet_order_delivered(order_id: int, admin_id: int) -> dict:
-    oid = int(order_id)
-    aid = int(admin_id)
-
-    with db.tx() as conn:
-        order = conn.execute(
-            "SELECT * FROM wallet_orders WHERE id = ?",
-            (oid,),
-        ).fetchone()
-
-        if not order:
-            raise ShopError("Заказ не найден")
-
-        if order["status"] == "delivered":
-            raise ShopError("Заказ уже выдан")
-
-        if order["status"] not in ("paid", "processing"):
-            raise ShopError("Заказ нельзя выдать в текущем статусе")
-
-        now = int(time.time())
-
-        updated = conn.execute(
-            """
-            UPDATE wallet_orders
-            SET status = 'delivered',
-                admin_id = ?,
-                updated_at = ?
-            WHERE id = ? AND status IN ('paid', 'processing')
-            """,
-            (aid, now, oid),
-        )
-
-        if updated.rowcount != 1:
-            raise ShopError("Не удалось обновить заказ")
-
-        conn.execute(
-            """
-            INSERT INTO admin_audit_log (
-                admin_id, action, target_type, target_id,
-                details, created_at
-            )
-            VALUES (?, 'deliver_order', 'wallet_order', ?, '', ?)
-            """,
-            (aid, oid, now),
-        )
-
-        result = conn.execute(
-            "SELECT * FROM wallet_orders WHERE id = ?",
-            (oid,),
-        ).fetchone()
-
-    return dict(result)
-
-
-# Legacy orders used by the Telegram Stars flow.
-
-def count_orders(user_id: int) -> int:
-    row = db.q_one(
-        "SELECT COUNT(*) AS total FROM legacy_orders WHERE user_id = ?",
-        (int(user_id),),
-    )
-    return int(row["total"]) if row else 0
-
-
-def list_orders(user_id: int, limit: int = 20) -> list:
-    limit, _ = _page(limit)
-    return db.q_all(
-        """
-        SELECT * FROM legacy_orders
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (int(user_id), limit),
-    )
+        return _dict(order)
 
 
 def get_order(order_id: int):
-    return db.q_one(
-        "SELECT * FROM legacy_orders WHERE id = ?",
-        (int(order_id),),
+    order_id = _positive_int(order_id, "ID заказа")
+
+    return _dict(
+        db.fetchone(
+            "SELECT * FROM wallet_orders WHERE id = ?",
+            (order_id,),
+        )
     )
 
 
-def create_order(user_id: int, recipient: str) -> dict:
-    uid = int(user_id)
+def get_user_orders(
+    user_id: int,
+    limit: int = 50,
+) -> list[dict]:
 
-    try:
-        recipient = normalize_recipient(recipient)
-    except ValueError as exc:
-        raise ShopError(str(exc)) from exc
+    user_id = _user_id(user_id)
+    limit = max(1, min(int(limit), 100))
 
-    if not recipient:
-        raise ShopError("Укажите получателя")
+    rows = db.fetchall(
+        """
+        SELECT *
+        FROM wallet_orders
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
 
-    with db.tx() as conn:
-        items = conn.execute(
+    return [_dict(row) for row in rows]
+
+
+def update_order_status(
+    order_id: int,
+    status: str,
+    admin_comment: str = "",
+) -> bool:
+
+    order_id = _positive_int(order_id, "ID заказа")
+
+    allowed = {
+        "pending",
+        "paid",
+        "processing",
+        "delivered",
+        "rejected",
+        "refunded",
+    }
+
+    if status not in allowed:
+        raise ValueError("Недопустимый статус заказа")
+
+    with db.transaction():
+        cursor = db.execute(
             """
-            SELECT ci.product_id, ci.qty,
-                   p.title, p.price_uzs,
-                   p.is_active, c.slug AS category_slug
-            FROM cart_items ci
-            JOIN products p ON p.id = ci.product_id
-            JOIN categories c ON c.id = p.category_id
-            WHERE ci.user_id = ? AND p.is_active = 1 AND c.is_active = 1
+            UPDATE wallet_orders
+            SET status = ?,
+                admin_comment = ?,
+                updated_at = ?
+            WHERE id = ?
             """,
-            (uid,),
-        ).fetchall()
-
-        if not items:
-            raise ShopError("Корзина пуста")
-
-        if any(item["category_slug"] != "other" for item in items):
-            raise ShopError(
-                "Оплата Telegram Stars разрешена только для категории «Другие товары»"
-            )
-
-        total = sum(
-            int(item["price_uzs"]) * int(item["qty"])
-            for item in items
+            (status, str(admin_comment), db.now(), order_id),
         )
 
-        if total <= 0:
-            raise ShopError("Некорректная сумма заказа")
-
-        now = int(time.time())
-
-        cur = conn.execute(
-            """
-            INSERT INTO legacy_orders (
-                user_id, recipient, total_amount,
-                currency, status, created_at, updated_at
-            )
-            VALUES (?, ?, ?, 'XTR', 'pending', ?, ?)
-            """,
-            (uid, recipient, total, now, now),
-        )
-
-        order_id = cur.lastrowid
-
-        for item in items:
-            conn.execute(
-                """
-                INSERT INTO legacy_order_items (
-                    order_id, product_id, title, price, qty
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    order_id,
-                    item["product_id"],
-                    item["title"],
-                    item["price_uzs"],
-                    item["qty"],
-                ),
-            )
-
-        conn.execute(
-            "DELETE FROM cart_items WHERE user_id = ?",
-            (uid,),
-        )
-
-        order = conn.execute(
-            "SELECT * FROM legacy_orders WHERE id = ?",
-            (order_id,),
-        ).fetchone()
-
-    return dict(order)
+        return cursor.rowcount > 0
 
 
-def cancel_order(order_id: int, user_id: int) -> bool:
-    with db.tx() as conn:
-        updated = conn.execute(
-            """
-            UPDATE legacy_orders
-            SET status = 'cancelled', updated_at = ?
-            WHERE id = ? AND user_id = ? AND status = 'pending'
-            """,
-            (int(time.time()), int(order_id), int(user_id)),
-        )
-        return updated.rowcount == 1
+# --------------------------------------------------
+# СОВМЕСТИМОСТЬ С ДРУГИМИ МОДУЛЯМИ
+# --------------------------------------------------
+
+list_categories = get_categories
+list_products = get_products
+product = get_product
+cart = get_cart
+purchase = create_wallet_order
+user_orders = get_user_orders
