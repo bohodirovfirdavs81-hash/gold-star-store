@@ -11,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from flask import Flask, abort, jsonify, send_from_directory, request
+from flask import Flask, abort, jsonify, request, send_from_directory
 from telebot import types
 
 import admin
@@ -408,6 +408,7 @@ def _setup_webhook() -> None:
             log.exception("set_webhook failed, retry in %ss", delay)
             time.sleep(delay)
             delay = min(delay * 2, 60)
+
     try:
         bot.set_my_commands(
             [
@@ -417,12 +418,20 @@ def _setup_webhook() -> None:
                 types.BotCommand("support", "Поддержка"),
             ]
         )
-        if config.WEBAPP_URL:
+    except Exception as exc:  # noqa: BLE001
+        log.warning("set_my_commands failed: %s", exc)
+
+    if config.WEBAPP_URL:
+        try:
             bot.set_chat_menu_button(
-                menu_button=types.MenuButtonWebApp(text="Магазин", web_app=types.WebAppInfo(config.WEBAPP_URL))
+                menu_button=types.MenuButtonWebApp(
+                    type="web_app",
+                    text="Магазин",
+                    web_app=types.WebAppInfo(config.WEBAPP_URL),
+                )
             )
-    except Exception:  # noqa: BLE001
-        log.exception("bot profile setup failed (не критично)")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("set_chat_menu_button failed: %s", exc)
 
 
 def _acquire_leader_lock() -> bool:
