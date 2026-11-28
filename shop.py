@@ -28,18 +28,18 @@ MAX_IDEMPOTENCY_KEY_LENGTH = 200
 
 
 class ShopError(Exception):
-    pass
+    """Ошибка бизнес-логики магазина."""
 
 
 # --------------------------------------------------
 # ОБЩИЕ ФУНКЦИИ
 # --------------------------------------------------
 
-def _page(limit: int, offset: int = 0):
+def _page(limit: int, offset: int = 0) -> tuple[int, int]:
     try:
         limit = int(limit)
         offset = int(offset)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ShopError("Некорректные параметры страницы")
 
     return (
@@ -123,7 +123,7 @@ def _timestamp() -> str:
 def _safe_int(value: Any, name: str) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise ShopError(f"Некорректное значение: {name}")
 
 
@@ -181,7 +181,7 @@ def get_category(category_id: int):
         "ID категории",
     )
 
-    return db.q_one(
+    row = db.q_one(
         """
         SELECT *
         FROM categories
@@ -189,6 +189,8 @@ def get_category(category_id: int):
         """,
         (category_id,),
     )
+
+    return dict(row) if row else None
 
 
 # --------------------------------------------------
@@ -207,14 +209,14 @@ def list_products(
     params: list[Any] = []
 
     if active_only:
-        conditions.extend([
-            "p.active = 1",
-            "c.active = 1",
-        ])
+        conditions.append("p.active = 1")
+        conditions.append(
+            "(p.category_id IS NULL OR c.active = 1)"
+        )
 
     if category_slug:
         conditions.append("c.slug = ?")
-        params.append(str(category_slug))
+        params.append(str(category_slug).strip())
 
     where = (
         " AND ".join(conditions)
@@ -258,7 +260,14 @@ def get_products(
     )
 
 
-def get_product(product_id: int):
+def get_product(product_id: int) -> dict[str, Any] | None:
+    """
+    Возвращает обычный dict.
+
+    Важно: payments.py и bot.py используют .get(),
+    поэтому sqlite3.Row здесь возвращать нельзя.
+    """
+
     product_id = _safe_int(
         product_id,
         "ID товара",
@@ -279,7 +288,7 @@ def get_product(product_id: int):
         (product_id,),
     )
 
-    return row
+    return dict(row) if row else None
 
 
 # --------------------------------------------------
@@ -760,7 +769,7 @@ def get_user_orders(
 def get_wallet_order(order_id: int):
     oid = _safe_int(order_id, "ID заказа")
 
-    return db.q_one(
+    row = db.q_one(
         """
         SELECT *
         FROM wallet_orders
@@ -768,6 +777,8 @@ def get_wallet_order(order_id: int):
         """,
         (oid,),
     )
+
+    return dict(row) if row else None
 
 
 # --------------------------------------------------
@@ -877,7 +888,7 @@ def refund_wallet_order_once(
         if updated.rowcount != 1:
             raise ShopError("Заказ уже обработан")
 
-        conn.execute(
+        wallet_update = conn.execute(
             """
             UPDATE wallets
             SET balance_uzs = ?,
@@ -892,6 +903,9 @@ def refund_wallet_order_once(
                 uid,
             ),
         )
+
+        if wallet_update.rowcount != 1:
+            raise ShopError("Не удалось выполнить возврат кошелька")
 
         # Возвращаем товар на склад.
         conn.execute(
@@ -1081,7 +1095,7 @@ def list_orders(
 def get_order(order_id: int):
     oid = _safe_int(order_id, "ID заказа")
 
-    return db.q_one(
+    row = db.q_one(
         """
         SELECT *
         FROM legacy_orders
@@ -1089,6 +1103,8 @@ def get_order(order_id: int):
         """,
         (oid,),
     )
+
+    return dict(row) if row else None
 
 
 def create_order(
@@ -1098,7 +1114,7 @@ def create_order(
     """
     Старый способ оформления заказов отключён.
 
-    Telegram Stars должны обрабатываться через
+    Telegram Stars обрабатываются через
     payments.create_xtr_invoice() и
     payments.process_xtr_success().
 
@@ -1118,6 +1134,9 @@ def cancel_order(
 
     oid = _safe_int(order_id, "ID заказа")
     uid = _safe_int(user_id, "ID пользователя")
+
+    if oid <= 0 or uid <= 0:
+        return False
 
     timestamp = _timestamp()
 
