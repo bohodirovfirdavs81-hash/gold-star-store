@@ -454,12 +454,20 @@ def help_callback(call):
             return
 
         if action == "menu":
-            # Сначала закрываем callback и показываем основную клавиатуру.
             safe_answer(call.id)
+
             bot.send_message(
                 chat_id,
-                "Главное меню.",
+                (
+                    f"⭐ <b>{h(config.BRAND)}</b>\n\n"
+                    "Добро пожаловать в магазин!\n\n"
+                    "Здесь можно просматривать товары, оформлять "
+                    "заказы и управлять кошельком.\n\n"
+                    "Для открытия магазина нажмите кнопку ниже. "
+                    "Если нужна инструкция, нажмите «❓ Помощь»."
+                ),
                 reply_markup=main_keyboard(),
+                disable_web_page_preview=True,
             )
             return
 
