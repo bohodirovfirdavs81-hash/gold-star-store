@@ -16,6 +16,7 @@ gunicorn bot:app --workers 1 --threads 8
 
 import logging
 import secrets
+import urllib.parse
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
@@ -56,8 +57,6 @@ logger = logging.getLogger("goldstar.bot")
 # TELEGRAM BOT
 # ---------------------------------------------------------
 
-# Webhook обрабатывается последовательно.
-# Это позволяет дождаться выполнения обработчиков.
 bot.threaded = False
 
 
@@ -84,12 +83,30 @@ app.register_blueprint(api.api)
 
 db.init_db()
 
+# Реферальная система.
+# Каждый приглашённый пользователь может быть привязан
+# только к одному пригласившему.
+db.execute("""
+CREATE TABLE IF NOT EXISTS referrals (
+    invitee_id INTEGER PRIMARY KEY,
+    inviter_id INTEGER NOT NULL,
+    subscription_rewarded INTEGER NOT NULL DEFAULT 0,
+    first_topup_rewarded INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+""")
+
 logger.info("База данных инициализирована")
 
 
 # ---------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------
+
+CHANNEL_USERNAME = "@GoldStarUz_News"
+CHANNEL_URL = "https://t.me/GoldStarUz_News"
+
 
 def user_name(user):
     name = " ".join(
@@ -129,16 +146,13 @@ def safe_int(value, default=0):
 
 
 def main_keyboard():
-    """Главная клавиатура пользователя."""
-    markup = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=1,
-    )
+    """Главное меню с inline-кнопками под сообщением."""
+    markup = types.InlineKeyboardMarkup(row_width=1)
 
     if config.WEBAPP_URL:
         markup.add(
-            types.KeyboardButton(
-                text="Открыть магазин",
+            types.InlineKeyboardButton(
+                text="🛍 Открыть магазин",
                 web_app=types.WebAppInfo(
                     url=config.WEBAPP_URL
                 ),
@@ -146,12 +160,35 @@ def main_keyboard():
         )
 
     markup.add(
-        types.KeyboardButton("Пополнить кошелёк"),
-        types.KeyboardButton("Мой профиль"),
-        types.KeyboardButton("❓ Помощь"),
+        types.InlineKeyboardButton(
+            text="💳 Пополнить кошелёк",
+            callback_data="menu:topup",
+        ),
+        types.InlineKeyboardButton(
+            text="🎁 Бонусы",
+            callback_data="menu:bonuses",
+        ),
+        types.InlineKeyboardButton(
+            text="👥 Пригласить друга",
+            callback_data="menu:invite",
+        ),
+        types.InlineKeyboardButton(
+            text="👤 Мой профиль",
+            callback_data="menu:profile",
+        ),
+        types.InlineKeyboardButton(
+            text="❓ Помощь",
+            callback_data="menu:help",
+        ),
     )
 
     return markup
+
+
+def home_keyboard():
+    return kb([
+        [btn("🏠 Главное меню", "menu:home")]
+    ])
 
 
 def notify_admins(text, reply_markup=None):
@@ -200,6 +237,284 @@ def ask_for_topup_receipt(message, topup_id):
 def utc_now():
     return datetime.now(timezone.utc).isoformat(
         timespec="seconds"
+    )
+
+
+# ---------------------------------------------------------
+# REFERRAL SYSTEM
+# ---------------------------------------------------------
+
+def register_referral(invitee_id, inviter_id):
+    """
+    Регистрирует приглашённого пользователя.
+    Повторная привязка к другому пригласившему невозможна.
+    """
+    invitee_id = safe_int(invitee_id)
+    inviter_id = safe_int(inviter_id)
+
+    if not invitee_id or not inviter_id:
+        return False
+
+    if invitee_id == inviter_id:
+        return False
+
+    timestamp = utc_now()
+
+    with db.transaction():
+        db.execute(
+            """
+            INSERT OR IGNORE INTO referrals(
+                invitee_id,
+                inviter_id,
+                subscription_rewarded,
+                first_topup_rewarded,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 0, 0, ?, ?)
+            """,
+            (
+                invitee_id,
+                inviter_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+        row = db.fetchone(
+            """
+            SELECT inviter_id
+            FROM referrals
+            WHERE invitee_id = ?
+            """,
+            (invitee_id,),
+        )
+
+    return bool(
+        row and int(row["inviter_id"]) == inviter_id
+    )
+
+
+def award_referral_bonus(
+    invitee_id,
+    reward_type,
+    amount,
+    description,
+):
+    """
+    Однократно начисляет бонус пригласившему
+    в бонусный баланс.
+
+    Все изменения выполняются в одной транзакции.
+    """
+    columns = {
+        "subscription": "subscription_rewarded",
+        "first_topup": "first_topup_rewarded",
+    }
+
+    column = columns.get(reward_type)
+
+    if not column:
+        raise ValueError("Неизвестный тип реферального бонуса")
+
+    invitee_id = int(invitee_id)
+    amount = int(amount)
+    timestamp = utc_now()
+
+    with db.transaction():
+        referral = db.fetchone(
+            f"""
+            SELECT inviter_id, {column} AS rewarded
+            FROM referrals
+            WHERE invitee_id = ?
+            """,
+            (invitee_id,),
+        )
+
+        if not referral:
+            return False
+
+        if int(referral["rewarded"] or 0):
+            return False
+
+        inviter_id = int(referral["inviter_id"])
+
+        # Сначала резервируем начисление.
+        # Если дальнейшая операция завершится ошибкой,
+        # транзакция откатится целиком.
+        cursor = db.execute(
+            f"""
+            UPDATE referrals
+            SET {column} = 1,
+                updated_at = ?
+            WHERE invitee_id = ?
+              AND {column} = 0
+            """,
+            (timestamp, invitee_id),
+        )
+
+        if cursor.rowcount != 1:
+            return False
+
+        wallet = db.fetchone(
+            """
+            SELECT balance_uzs, bonus_uzs
+            FROM wallets
+            WHERE user_id = ?
+            """,
+            (inviter_id,),
+        )
+
+        if not wallet:
+            raise RuntimeError(
+                f"Кошелёк пригласившего {inviter_id} не найден"
+            )
+
+        balance = int(wallet["balance_uzs"] or 0)
+        old_bonus = int(wallet["bonus_uzs"] or 0)
+        new_bonus = old_bonus + amount
+
+        db.execute(
+            """
+            UPDATE wallets
+            SET bonus_uzs = ?,
+                updated_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                new_bonus,
+                timestamp,
+                inviter_id,
+            ),
+        )
+
+        db.execute(
+            """
+            INSERT INTO wallet_transactions(
+                user_id,
+                transaction_type,
+                amount_uzs,
+                balance_delta,
+                bonus_delta,
+                balance_after,
+                bonus_after,
+                reference_type,
+                reference_id,
+                description,
+                created_at
+            )
+            VALUES (
+                ?,
+                'referral_bonus',
+                ?,
+                0,
+                ?,
+                ?,
+                ?,
+                'referral',
+                ?,
+                ?,
+                ?
+            )
+            """,
+            (
+                inviter_id,
+                amount,
+                amount,
+                balance,
+                new_bonus,
+                str(invitee_id),
+                description,
+                timestamp,
+            ),
+        )
+
+    try:
+        notify(
+            inviter_id,
+            (
+                "🎁 Вам начислен реферальный бонус!\n\n"
+                f"Сумма: <b>{uzs(amount)}</b>\n"
+                f"Причина: {h(description)}"
+            ),
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось отправить уведомление о реферальном бонусе"
+        )
+
+    logger.info(
+        "Реферальный бонус начислен: inviter=%s invitee=%s amount=%s type=%s",
+        inviter_id,
+        invitee_id,
+        amount,
+        reward_type,
+    )
+
+    return True
+
+
+def check_referral_subscription(user_id):
+    """
+    Проверяет подписку на обязательный канал.
+    Бот должен быть администратором канала.
+    """
+    try:
+        member = bot.get_chat_member(
+            chat_id=CHANNEL_USERNAME,
+            user_id=int(user_id),
+        )
+
+        status = getattr(member, "status", "")
+
+        if status in ("member", "administrator", "creator"):
+            return True
+
+        if (
+            status == "restricted"
+            and bool(getattr(member, "is_member", False))
+        ):
+            return True
+
+        return False
+
+    except Exception:
+        logger.exception(
+            "Не удалось проверить подписку пользователя %s",
+            user_id,
+        )
+        return False
+
+
+def referral_link(user_id):
+    me = bot.get_me()
+    username = getattr(me, "username", None)
+
+    if not username:
+        raise RuntimeError(
+            "Не удалось определить username бота"
+        )
+
+    return (
+        f"https://t.me/{username}"
+        f"?start=ref_{int(user_id)}"
+    )
+
+
+def referral_welcome_keyboard():
+    return types.InlineKeyboardMarkup(row_width=1).add(
+        types.InlineKeyboardButton(
+            text="📢 Подписаться на канал",
+            url=CHANNEL_URL,
+        ),
+        types.InlineKeyboardButton(
+            text="✅ Проверить подписку",
+            callback_data="ref:verify",
+        ),
+        types.InlineKeyboardButton(
+            text="🏠 Главное меню",
+            callback_data="menu:home",
+        ),
     )
 
 
@@ -255,15 +570,14 @@ HELP_TOPICS = {
         "title": "Как получить бонусы?",
         "text": (
             "<b>🎁 Как получить бонусы?</b>\n\n"
-            "В магазине предусмотрен отдельный бонусный баланс. "
-            "Если бонусы начислены на ваш аккаунт, их количество "
-            "можно посмотреть в разделе «Мой профиль».\n\n"
-            "При оформлении заказа бонусы могут покрывать не более "
-            "50% его стоимости.\n\n"
-            "Реферальные начисления и проверка подписки на канал "
-            "пока не подключены в этой версии бота. Не рассчитывайте "
-            "на бонус за приглашение, пока соответствующая функция "
-            "не будет запущена."
+            "Приглашайте друзей в Gold Star Store:\n\n"
+            "• <b>+250 сум</b> — когда приглашённый друг "
+            "запустит бота и подтвердит подписку на @GoldStarUz_News.\n"
+            "• <b>+500 сум</b> — после первого успешного пополнения "
+            "кошелька приглашённым другом.\n\n"
+            "Оба бонуса получает только пригласивший. "
+            "Каждый бонус начисляется один раз за друга.\n\n"
+            "Бонусный баланс можно посмотреть в профиле."
         ),
     },
     "stars": {
@@ -296,7 +610,6 @@ HELP_TOPICS = {
 
 
 def help_keyboard():
-    """Inline-клавиатура со списком тем справки."""
     return kb([
         [btn("🛍 Как купить товар?", "help:buy")],
         [btn("💳 Как пополнить баланс?", "help:topup")],
@@ -305,12 +618,11 @@ def help_keyboard():
         [btn("⭐ Как работает Telegram Stars?", "help:stars")],
         [btn("🌐 Как изменить язык?", "help:language")],
         [btn("❓ Другой вопрос", "help:other")],
-        [btn("⬅️ Главное меню", "help:menu")],
+        [btn("🏠 Главное меню", "help:menu")],
     ])
 
 
 def help_topic_keyboard():
-    """Кнопки возврата из инструкции."""
     return kb([
         [btn("⬅️ Назад к вопросам", "help:questions")],
         [btn("🏠 Главное меню", "help:menu")],
@@ -318,7 +630,6 @@ def help_topic_keyboard():
 
 
 def other_help_keyboard():
-    """Кнопки отдельного экрана поддержки."""
     return types.InlineKeyboardMarkup(row_width=1).add(
         types.InlineKeyboardButton(
             text="💬 Написать в поддержку",
@@ -327,6 +638,10 @@ def other_help_keyboard():
         types.InlineKeyboardButton(
             text="🔙 Назад к вопросам",
             callback_data="help:questions",
+        ),
+        types.InlineKeyboardButton(
+            text="🏠 Главное меню",
+            callback_data="menu:home",
         ),
     )
 
@@ -346,29 +661,318 @@ def send_help_menu(chat_id):
 
 
 # ---------------------------------------------------------
+# MAIN MENU CALLBACKS
+# ---------------------------------------------------------
+
+@bot.callback_query_handler(
+    func=lambda c: bool(c.data)
+    and c.data.startswith("menu:")
+)
+def main_menu_callback(call):
+    try:
+        if not call.message:
+            safe_answer(call.id, "Сообщение недоступно", True)
+            return
+
+        action = call.data.split(":", 1)[1]
+        user_id = call.from_user.id
+        chat_id = call.message.chat.id
+
+        if action == "home":
+            show(
+                call,
+                (
+                    f"⭐ <b>{h(config.BRAND)}</b>\n\n"
+                    "Добро пожаловать в магазин!\n\n"
+                    "Выберите нужный раздел:"
+                ),
+                main_keyboard(),
+            )
+            safe_answer(call.id)
+            return
+
+        if action == "help":
+            show(
+                call,
+                (
+                    "<b>❓ Помощь Gold Star Store</b>\n\n"
+                    "Выберите вопрос, чтобы открыть подробную инструкцию."
+                ),
+                help_keyboard(),
+            )
+            safe_answer(call.id)
+            return
+
+        if action == "profile":
+            db.upsert_user(get_user_info(call.from_user))
+
+            user = db.get_user(user_id)
+            wallet = db.get_wallet(user_id)
+
+            if not user:
+                safe_answer(call.id, "Профиль не найден", True)
+                return
+
+            balance = wallet["balance_uzs"] if wallet else 0
+            bonus = wallet["bonus_uzs"] if wallet else 0
+
+            show(
+                call,
+                (
+                    "<b>👤 Мой профиль</b>\n\n"
+                    f"ID: <code>{user_id}</code>\n"
+                    f"Имя: {h(user_name(call.from_user))}\n\n"
+                    f"Основной баланс: <b>{uzs(balance)}</b>\n"
+                    f"Бонусы: <b>{uzs(bonus)}</b>"
+                ),
+                home_keyboard(),
+            )
+            safe_answer(call.id)
+            return
+
+        if action == "topup":
+            db.upsert_user(get_user_info(call.from_user))
+
+            prompt = bot.send_message(
+                chat_id,
+                (
+                    "<b>💳 Пополнение кошелька</b>\n\n"
+                    f"Минимальная сумма: {uzs(config.TOPUP_MIN_UZS)}\n"
+                    f"Максимальная сумма: {uzs(config.TOPUP_MAX_UZS)}\n\n"
+                    "Отправьте сумму пополнения числом."
+                ),
+                reply_markup=types.ForceReply(
+                    selective=True,
+                    input_field_placeholder="Например: 50000",
+                ),
+            )
+
+            bot.register_next_step_handler(
+                prompt,
+                process_topup_amount,
+            )
+
+            safe_answer(call.id)
+            return
+
+        if action == "bonuses":
+            show(
+                call,
+                (
+                    "<b>🎁 Реферальные бонусы</b>\n\n"
+                    "Приглашайте друзей в Gold Star Store:\n\n"
+                    "• <b>+250 сум</b> — когда друг запустит бота "
+                    "и подтвердит подписку на @GoldStarUz_News.\n"
+                    "• <b>+500 сум</b> — после первого успешного "
+                    "пополнения кошелька приглашённым другом.\n\n"
+                    "Оба бонуса получает только пригласивший. "
+                    "Каждое начисление выполняется один раз."
+                ),
+                kb([
+                    [btn("👥 Пригласить друга", "menu:invite")],
+                    [btn("🏠 Главное меню", "menu:home")],
+                ]),
+            )
+            safe_answer(call.id)
+            return
+
+        if action == "invite":
+            link = referral_link(user_id)
+
+            share_text = (
+                "Присоединяйся к Gold Star Store! "
+                "Переходи по моей ссылке:"
+            )
+
+            share_url = (
+                "https://t.me/share/url?url="
+                + urllib.parse.quote(link, safe="")
+                + "&text="
+                + urllib.parse.quote(share_text, safe="")
+            )
+
+            markup = types.InlineKeyboardMarkup(row_width=1)
+
+            markup.add(
+                types.InlineKeyboardButton(
+                    text="📨 Выбрать друга",
+                    url=share_url,
+                ),
+                types.InlineKeyboardButton(
+                    text="🔗 Моя реферальная ссылка",
+                    url=link,
+                ),
+                types.InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="menu:home",
+                ),
+            )
+
+            show(
+                call,
+                (
+                    "<b>👥 Пригласить друга</b>\n\n"
+                    "Отправьте другу свою персональную ссылку.\n\n"
+                    "За каждого нового приглашённого друга:\n"
+                    "• +250 сум — после подтверждения подписки на канал.\n"
+                    "• +500 сум — после первого успешного пополнения.\n\n"
+                    "Бонусы получает только пригласивший."
+                ),
+                markup,
+            )
+
+            safe_answer(call.id)
+            return
+
+        safe_answer(call.id, "Раздел не найден", True)
+
+    except Exception:
+        logger.exception("Ошибка главного меню")
+        safe_answer(call.id, "Не удалось открыть раздел", True)
+
+
+# ---------------------------------------------------------
+# REFERRAL SUBSCRIPTION VERIFICATION
+# ---------------------------------------------------------
+
+@bot.callback_query_handler(
+    func=lambda c: bool(c.data)
+    and c.data == "ref:verify"
+)
+def referral_verify_callback(call):
+    try:
+        invitee_id = call.from_user.id
+
+        referral = db.fetchone(
+            """
+            SELECT inviter_id, subscription_rewarded
+            FROM referrals
+            WHERE invitee_id = ?
+            """,
+            (invitee_id,),
+        )
+
+        if not referral:
+            safe_answer(
+                call.id,
+                "Реферальная ссылка не найдена.",
+                True,
+            )
+            return
+
+        if int(referral["subscription_rewarded"] or 0):
+            safe_answer(
+                call.id,
+                "Бонус за подписку уже был начислен.",
+                True,
+            )
+            return
+
+        if not check_referral_subscription(invitee_id):
+            safe_answer(
+                call.id,
+                (
+                    "Подписка не найдена. "
+                    "Подпишитесь на канал и попробуйте снова."
+                ),
+                True,
+            )
+            return
+
+        credited = award_referral_bonus(
+            invitee_id,
+            "subscription",
+            250,
+            "Бонус за подписку приглашённого пользователя",
+        )
+
+        if credited:
+            try:
+                bot.send_message(
+                    invitee_id,
+                    (
+                        "✅ Подписка подтверждена!\n\n"
+                        "Пригласившему начислено 250 сум."
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось уведомить приглашённого"
+                )
+
+        show(
+            call,
+            (
+                "<b>✅ Подписка подтверждена</b>\n\n"
+                "Спасибо за подписку на @GoldStarUz_News.\n\n"
+                "Пригласившему начислен бонус 250 сум, "
+                "если это первое подтверждение."
+            ),
+            home_keyboard(),
+        )
+
+        safe_answer(call.id)
+
+    except Exception:
+        logger.exception("Ошибка проверки реферальной подписки")
+        safe_answer(
+            call.id,
+            "Не удалось проверить подписку. Попробуйте позже.",
+            True,
+        )
+
+
+# ---------------------------------------------------------
 # USER COMMANDS
 # ---------------------------------------------------------
 
 @bot.message_handler(commands=["start"])
 def start_handler(message):
     try:
+        user_id = message.from_user.id
+
         logger.info(
             "START_HANDLER вызван: user_id=%s, text=%r",
-            message.from_user.id,
+            user_id,
             message.text,
         )
+
+        # Проверяем, был ли пользователь в базе до этого запуска.
+        existing_user = db.get_user(user_id)
 
         db.upsert_user(
             get_user_info(message.from_user)
         )
+
+        # Регистрируем реферала только при первом появлении пользователя.
+        referral_registered = False
+
+        parts = (message.text or "").split(maxsplit=1)
+
+        if not existing_user and len(parts) == 2:
+            payload = parts[1].strip()
+
+            if payload.startswith("ref_"):
+                inviter_id = safe_int(payload[4:])
+
+                referral_registered = register_referral(
+                    user_id,
+                    inviter_id,
+                )
+
+                if referral_registered:
+                    logger.info(
+                        "Реферал зарегистрирован: inviter=%s invitee=%s",
+                        inviter_id,
+                        user_id,
+                    )
 
         text = (
             f"⭐ <b>{h(config.BRAND)}</b>\n\n"
             "Добро пожаловать в магазин!\n\n"
             "Здесь можно просматривать товары, оформлять "
             "заказы и управлять кошельком.\n\n"
-            "Для открытия магазина нажмите кнопку ниже. "
-            "Если нужна инструкция, нажмите «❓ Помощь»."
+            "Выберите нужный раздел:"
         )
 
         bot.send_message(
@@ -378,9 +982,26 @@ def start_handler(message):
             disable_web_page_preview=True,
         )
 
+        # Новый приглашённый получает отдельное сообщение
+        # с кнопкой подписки и проверки.
+        if referral_registered:
+            bot.send_message(
+                message.chat.id,
+                (
+                    "<b>🎁 Вас пригласили в Gold Star Store!</b>\n\n"
+                    "Чтобы пригласивший получил бонус 250 сум, "
+                    "подпишитесь на наш канал и нажмите "
+                    "«Проверить подписку».\n\n"
+                    "После вашего первого успешного пополнения "
+                    "пригласившему дополнительно начислится 500 сум."
+                ),
+                reply_markup=referral_welcome_keyboard(),
+                disable_web_page_preview=True,
+            )
+
         logger.info(
             "Ответ /start отправлен: user_id=%s",
-            message.from_user.id,
+            user_id,
         )
 
     except Exception:
@@ -421,7 +1042,6 @@ def help_callback(call):
             return
 
         action = call.data.split(":", 1)[1]
-        chat_id = call.message.chat.id
 
         if action == "questions":
             show(
@@ -443,10 +1063,9 @@ def help_callback(call):
                 (
                     "<b>❓ Другой вопрос</b>\n\n"
                     "Если вы не нашли подходящий ответ в разделе помощи, "
-                    "напишите нам в личные сообщения. Мы постараемся "
-                    "помочь вам и ответить на ваши вопросы.\n\n"
+                    "напишите нам в личные сообщения.\n\n"
                     "💬 Поддержка: @GoldStar_help\n\n"
-                    "⭐ Будем рады вам помочь!"
+                    "Мы постараемся помочь вам."
                 ),
                 other_help_keyboard(),
             )
@@ -454,21 +1073,16 @@ def help_callback(call):
             return
 
         if action == "menu":
-            safe_answer(call.id)
-
-            bot.send_message(
-                chat_id,
+            show(
+                call,
                 (
                     f"⭐ <b>{h(config.BRAND)}</b>\n\n"
                     "Добро пожаловать в магазин!\n\n"
-                    "Здесь можно просматривать товары, оформлять "
-                    "заказы и управлять кошельком.\n\n"
-                    "Для открытия магазина нажмите кнопку ниже. "
-                    "Если нужна инструкция, нажмите «❓ Помощь»."
+                    "Выберите нужный раздел:"
                 ),
-                reply_markup=main_keyboard(),
-                disable_web_page_preview=True,
+                main_keyboard(),
             )
+            safe_answer(call.id)
             return
 
         topic = HELP_TOPICS.get(action)
@@ -482,6 +1096,7 @@ def help_callback(call):
             topic["text"],
             help_topic_keyboard(),
         )
+
         safe_answer(call.id)
 
     except Exception:
@@ -505,6 +1120,7 @@ def profile_handler(message):
             bot.send_message(
                 message.chat.id,
                 "Не удалось загрузить профиль.",
+                reply_markup=home_keyboard(),
             )
             return
 
@@ -514,13 +1130,13 @@ def profile_handler(message):
         bot.send_message(
             message.chat.id,
             (
-                "<b>Мой профиль</b>\n\n"
+                "<b>👤 Мой профиль</b>\n\n"
                 f"ID: <code>{user_id}</code>\n"
                 f"Имя: {h(user_name(message.from_user))}\n\n"
                 f"Основной баланс: <b>{uzs(balance)}</b>\n"
                 f"Бонусы: <b>{uzs(bonus)}</b>"
             ),
-            reply_markup=main_keyboard(),
+            reply_markup=home_keyboard(),
         )
 
     except Exception:
@@ -529,6 +1145,7 @@ def profile_handler(message):
         bot.send_message(
             message.chat.id,
             "Не удалось загрузить профиль.",
+            reply_markup=home_keyboard(),
         )
 
 
@@ -558,7 +1175,7 @@ def topup_start_handler(message):
         prompt = bot.send_message(
             message.chat.id,
             (
-                "<b>Пополнение кошелька</b>\n\n"
+                "<b>💳 Пополнение кошелька</b>\n\n"
                 f"Минимальная сумма: {uzs(config.TOPUP_MIN_UZS)}\n"
                 f"Максимальная сумма: {uzs(config.TOPUP_MAX_UZS)}\n\n"
                 "Отправьте сумму пополнения числом."
@@ -580,6 +1197,7 @@ def topup_start_handler(message):
         bot.send_message(
             message.chat.id,
             "Не удалось начать пополнение.",
+            reply_markup=home_keyboard(),
         )
 
 
@@ -588,6 +1206,7 @@ def process_topup_amount(message):
         bot.send_message(
             message.chat.id,
             "Отправьте сумму обычным текстом.",
+            reply_markup=home_keyboard(),
         )
         return
 
@@ -631,6 +1250,7 @@ def process_topup_amount(message):
                 "Баланс будет пополнен только после "
                 "проверки платежа администратором."
             ),
+            reply_markup=home_keyboard(),
         )
 
         ask_for_topup_receipt(
@@ -662,6 +1282,7 @@ def process_topup_amount(message):
         bot.send_message(
             message.chat.id,
             "Не удалось создать заявку. Попробуйте позже.",
+            reply_markup=home_keyboard(),
         )
 
 
@@ -735,6 +1356,7 @@ def process_topup_receipt(message, topup_id):
                     "Чек сохранён, но не удалось уведомить "
                     "администраторов. Обратитесь в поддержку."
                 ),
+                reply_markup=home_keyboard(),
             )
             return
 
@@ -745,12 +1367,14 @@ def process_topup_receipt(message, topup_id):
                 "Заявка ожидает проверки.\n\n"
                 "Деньги пока не начислены."
             ),
+            reply_markup=home_keyboard(),
         )
 
     except ValueError as exc:
         bot.send_message(
             message.chat.id,
             f"Ошибка: {h(exc)}",
+            reply_markup=home_keyboard(),
         )
 
     except Exception:
@@ -762,6 +1386,7 @@ def process_topup_receipt(message, topup_id):
                 "Не удалось обработать чек. "
                 "Обратитесь к администратору."
             ),
+            reply_markup=home_keyboard(),
         )
 
 
@@ -1118,6 +1743,20 @@ def topup_admin_callback(call):
                 "Подтверждено администратором",
             )
 
+            # Реферальные +500 начисляются только после
+            # успешного подтверждения первого пополнения.
+            try:
+                award_referral_bonus(
+                    result["user_id"],
+                    "first_topup",
+                    500,
+                    "Бонус за первое пополнение приглашённого пользователя",
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось начислить реферальный бонус за пополнение"
+                )
+
             notify(
                 result["user_id"],
                 (
@@ -1126,7 +1765,11 @@ def topup_admin_callback(call):
                 ),
             )
 
-            show(call, f"Пополнение №{topup_id} подтверждено.")
+            show(
+                call,
+                f"Пополнение №{topup_id} подтверждено.",
+                home_keyboard(),
+            )
             safe_answer(call.id, "Баланс пополнен")
 
         elif action == "reject":
@@ -1144,7 +1787,11 @@ def topup_admin_callback(call):
                 ),
             )
 
-            show(call, f"Пополнение №{topup_id} отклонено.")
+            show(
+                call,
+                f"Пополнение №{topup_id} отклонено.",
+                home_keyboard(),
+            )
             safe_answer(call.id, "Заявка отклонена")
 
         else:
@@ -1180,16 +1827,22 @@ def request_admin(message, request_type):
             bot.send_message(
                 message.chat.id,
                 "Заявка отправлена администраторам. Ожидайте ответа.",
+                reply_markup=home_keyboard(),
             )
         else:
             bot.send_message(
                 message.chat.id,
                 "Не удалось отправить заявку. Попробуйте позже.",
+                reply_markup=home_keyboard(),
             )
 
     except Exception:
         logger.exception("Ошибка создания заявки %s", request_type)
-        bot.send_message(message.chat.id, "Не удалось отправить заявку.")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось отправить заявку.",
+            reply_markup=home_keyboard(),
+        )
 
 
 @bot.message_handler(commands=["premium"])
@@ -1240,8 +1893,13 @@ def stars_handler(message):
             bot.send_message(
                 message.chat.id,
                 "Сейчас нет товаров для оплаты Telegram Stars.",
+                reply_markup=home_keyboard(),
             )
             return
+
+        buttons.append([
+            btn("🏠 Главное меню", "menu:home")
+        ])
 
         bot.send_message(
             message.chat.id,
@@ -1254,7 +1912,11 @@ def stars_handler(message):
 
     except Exception:
         logger.exception("Ошибка списка Stars")
-        bot.send_message(message.chat.id, "Не удалось загрузить товары.")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось загрузить товары.",
+            reply_markup=home_keyboard(),
+        )
 
 
 @bot.callback_query_handler(
@@ -1345,6 +2007,7 @@ def successful_payment_handler(message):
                 f"Сумма: {result['amount_xtr']} ⭐\n"
                 f"Заказ: #{result['id']}"
             ),
+            reply_markup=home_keyboard(),
         )
 
         notify_admins(
@@ -1369,9 +2032,12 @@ def successful_payment_handler(message):
                     "Не оплачивайте повторно. Обратитесь к администратору "
                     "и укажите ID платежа."
                 ),
+                reply_markup=home_keyboard(),
             )
         except Exception:
-            logger.exception("Не удалось уведомить пользователя о проблеме Stars")
+            logger.exception(
+                "Не удалось уведомить пользователя о проблеме Stars"
+            )
 
         notify_admins(
             (
