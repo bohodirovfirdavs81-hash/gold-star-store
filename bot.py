@@ -201,6 +201,11 @@ def utc_now():
 @bot.message_handler(commands=["start"])
 def start_handler(message):
     try:
+        logger.info(
+            "START_HANDLER вызван: user_id=%s, text=%r",
+            message.from_user.id,
+            message.text,
+        )
         db.upsert_user(
             get_user_info(message.from_user)
         )
