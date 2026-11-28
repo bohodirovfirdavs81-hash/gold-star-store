@@ -2,17 +2,21 @@
 """
 Gold Star Store — платежи и пополнения.
 
-Поддерживает:
-- Ручные пополнения UZS с подтверждением администратора.
-- Telegram Stars (XTR) только для категории other.
-- Защиту от повторного начисления и повторной обработки платежей.
+Ручные пополнения UZS:
+- заявка;
+- чек;
+- подтверждение администратором;
+- однократное начисление.
 
-Важно:
-Чек пользователя сам по себе не подтверждает оплату.
-Начисление UZS выполняется только после решения администратора.
+Telegram Stars:
+- только категория other;
+- только fulfillment_mode='xtr';
+- проверка пользователя, суммы, валюты и товара;
+- защита от повторной обработки платежа.
+
+Чек сам по себе не подтверждает оплату.
 """
 
-import json
 import secrets
 import sqlite3
 from typing import Any
@@ -38,8 +42,15 @@ TOPUP_MIN_UZS = _config_int("TOPUP_MIN_UZS", 1000)
 TOPUP_MAX_UZS = _config_int("TOPUP_MAX_UZS", 10000000)
 
 
+# --------------------------------------------------
+# ОБЩИЕ ФУНКЦИИ
+# --------------------------------------------------
+
 def _uid(value: Any) -> int:
-    value = int(value or 0)
+    try:
+        value = int(value or 0)
+    except (TypeError, ValueError):
+        raise ValueError("Некорректный ID пользователя")
 
     if value <= 0:
         raise ValueError("Некорректный ID пользователя")
@@ -63,6 +74,15 @@ def _dict(row):
     return dict(row) if row is not None else None
 
 
+def _text(value: Any, max_length: int = 1000) -> str:
+    result = str(value or "").strip()
+
+    if len(result) > max_length:
+        raise ValueError("Слишком длинный текст")
+
+    return result
+
+
 # --------------------------------------------------
 # РУЧНЫЕ ПОПОЛНЕНИЯ
 # --------------------------------------------------
@@ -73,8 +93,7 @@ def create_topup(
     idempotency_key: str | None = None,
 ) -> dict:
     """
-    Создаёт заявку на пополнение.
-    Деньги на этом этапе не начисляются.
+    Создаёт заявку без начисления денег.
     """
 
     user_id = _uid(user_id)
@@ -87,17 +106,15 @@ def create_topup(
         )
 
     if idempotency_key is not None:
-        idempotency_key = str(idempotency_key).strip()
+        idempotency_key = _text(idempotency_key, 128)
 
-        if not idempotency_key or len(idempotency_key) > 128:
+        if not idempotency_key:
             raise ValueError("Некорректный ключ заявки")
 
     timestamp = db.now()
 
     with db.transaction():
-        user = db.get_user(user_id)
-
-        if not user:
+        if not db.get_user(user_id):
             raise ValueError("Пользователь не найден")
 
         if idempotency_key:
@@ -105,12 +122,18 @@ def create_topup(
                 """
                 SELECT *
                 FROM topups
-                WHERE user_id = ? AND idempotency_key = ?
+                WHERE user_id = ?
+                  AND idempotency_key = ?
                 """,
                 (user_id, idempotency_key),
             )
 
             if existing:
+                if int(existing["amount_uzs"]) != amount_uzs:
+                    raise ValueError(
+                        "Этот ключ уже использован для другой суммы"
+                    )
+
                 return _dict(existing)
 
         cursor = db.execute(
@@ -134,12 +157,12 @@ def create_topup(
             ),
         )
 
-        topup = db.fetchone(
+        row = db.fetchone(
             "SELECT * FROM topups WHERE id = ?",
             (cursor.lastrowid,),
         )
 
-        return _dict(topup)
+        return _dict(row)
 
 
 def get_topup(topup_id: int):
@@ -185,7 +208,8 @@ def get_pending_topups(limit: int = 50) -> list[dict]:
             u.username,
             u.first_name
         FROM topups t
-        LEFT JOIN users u ON u.telegram_id = t.user_id
+        LEFT JOIN users u
+            ON u.telegram_id = t.user_id
         WHERE t.status = 'pending'
         ORDER BY t.id ASC
         LIMIT ?
@@ -203,21 +227,17 @@ def attach_topup_receipt(
     note: str = "",
 ) -> dict:
     """
-    Сохраняет Telegram file_id чека.
-    Не подтверждает оплату.
+    Сохраняет чек. Не начисляет деньги.
     """
 
     topup_id = _positive(topup_id, "ID пополнения")
     user_id = _uid(user_id)
 
-    file_id = str(file_id or "").strip()
-    note = str(note or "").strip()
+    file_id = _text(file_id, 500)
+    note = _text(note, 1000)
 
     if not file_id:
         raise ValueError("Не указан файл чека")
-
-    if len(note) > 1000:
-        raise ValueError("Комментарий слишком длинный")
 
     with db.transaction():
         topup = db.fetchone(
@@ -233,15 +253,17 @@ def attach_topup_receipt(
             raise ValueError("Заявка не найдена")
 
         if topup["status"] != "pending":
-            raise ValueError("Эта заявка уже обработана")
+            raise ValueError("Заявка уже обработана")
 
-        db.execute(
+        cursor = db.execute(
             """
             UPDATE topups
             SET receipt_file_id = ?,
                 receipt_note = ?,
                 updated_at = ?
-            WHERE id = ? AND user_id = ? AND status = 'pending'
+            WHERE id = ?
+              AND user_id = ?
+              AND status = 'pending'
             """,
             (
                 file_id,
@@ -252,11 +274,14 @@ def attach_topup_receipt(
             ),
         )
 
+        if cursor.rowcount != 1:
+            raise ValueError("Не удалось сохранить чек")
+
         return get_topup(topup_id)
 
 
 # --------------------------------------------------
-# НАЧИСЛЕНИЕ ДЕНЕГ
+# ПОДТВЕРЖДЕНИЕ ПОПОЛНЕНИЯ
 # --------------------------------------------------
 
 def approve_topup(
@@ -265,48 +290,59 @@ def approve_topup(
     admin_comment: str = "",
 ) -> dict:
     """
-    Подтверждает пополнение и начисляет UZS один раз.
+    Подтверждает пополнение и начисляет деньги один раз.
 
-    Повторное подтверждение не создаёт повторного начисления.
+    Все изменения выполняются атомарно.
     """
 
     topup_id = _positive(topup_id, "ID пополнения")
     admin_id = _uid(admin_id)
+    admin_comment = _text(admin_comment, 1000)
 
     timestamp = db.now()
 
     with db.transaction():
         topup = db.fetchone(
-            "SELECT * FROM topups WHERE id = ?",
+            """
+            SELECT *
+            FROM topups
+            WHERE id = ?
+            """,
             (topup_id,),
         )
 
         if not topup:
             raise ValueError("Заявка не найдена")
 
-        if topup["status"] == "approved":
-            raise ValueError("Заявка уже подтверждена")
-
         if topup["status"] != "pending":
-            raise ValueError("Заявка не ожидает подтверждения")
+            raise ValueError("Заявка уже обработана")
 
-        amount = int(topup["amount_uzs"])
+        amount = _positive(
+            topup["amount_uzs"],
+            "Сумма пополнения",
+        )
 
-        if amount <= 0:
-            raise ValueError("Некорректная сумма пополнения")
-
-        user_id = int(topup["user_id"])
+        user_id = _uid(topup["user_id"])
 
         wallet = db.fetchone(
-            "SELECT * FROM wallets WHERE user_id = ?",
+            """
+            SELECT *
+            FROM wallets
+            WHERE user_id = ?
+            """,
             (user_id,),
         )
 
         if not wallet:
             raise ValueError("Кошелёк пользователя не найден")
 
-        new_balance = int(wallet["balance_uzs"]) + amount
-        new_bonus = int(wallet["bonus_uzs"])
+        old_balance = int(wallet["balance_uzs"])
+        old_bonus = int(wallet["bonus_uzs"])
+
+        if old_balance < 0 or old_bonus < 0:
+            raise ValueError("Некорректный баланс кошелька")
+
+        new_balance = old_balance + amount
 
         cursor = db.execute(
             """
@@ -316,11 +352,12 @@ def approve_topup(
                 admin_comment = ?,
                 confirmed_at = ?,
                 updated_at = ?
-            WHERE id = ? AND status = 'pending'
+            WHERE id = ?
+              AND status = 'pending'
             """,
             (
                 admin_id,
-                str(admin_comment),
+                admin_comment,
                 timestamp,
                 timestamp,
                 topup_id,
@@ -330,15 +367,26 @@ def approve_topup(
         if cursor.rowcount != 1:
             raise ValueError("Заявка уже была обработана")
 
-        db.execute(
+        wallet_cursor = db.execute(
             """
             UPDATE wallets
             SET balance_uzs = ?,
                 updated_at = ?
             WHERE user_id = ?
+              AND balance_uzs = ?
+              AND bonus_uzs = ?
             """,
-            (new_balance, timestamp, user_id),
+            (
+                new_balance,
+                timestamp,
+                user_id,
+                old_balance,
+                old_bonus,
+            ),
         )
+
+        if wallet_cursor.rowcount != 1:
+            raise ValueError("Не удалось обновить кошелёк")
 
         db.execute(
             """
@@ -365,7 +413,7 @@ def approve_topup(
                 amount,
                 amount,
                 new_balance,
-                new_bonus,
+                old_bonus,
                 str(topup_id),
                 f"Пополнение №{topup_id}",
                 timestamp,
@@ -393,15 +441,20 @@ def reject_topup(
     reason: str = "",
 ) -> dict:
     """
-    Отклоняет заявку без изменения баланса.
+    Отклоняет заявку без изменения кошелька.
     """
 
     topup_id = _positive(topup_id, "ID пополнения")
     admin_id = _uid(admin_id)
+    reason = _text(reason, 1000)
 
     with db.transaction():
         topup = db.fetchone(
-            "SELECT * FROM topups WHERE id = ?",
+            """
+            SELECT *
+            FROM topups
+            WHERE id = ?
+            """,
             (topup_id,),
         )
 
@@ -418,11 +471,12 @@ def reject_topup(
                 admin_id = ?,
                 admin_comment = ?,
                 updated_at = ?
-            WHERE id = ? AND status = 'pending'
+            WHERE id = ?
+              AND status = 'pending'
             """,
             (
                 admin_id,
-                str(reason),
+                reason,
                 db.now(),
                 topup_id,
             ),
@@ -448,7 +502,7 @@ def reject_topup(
 
 def _ensure_xtr_orders_table() -> None:
     """
-    Отдельная таблица для заказов, оплаченных Telegram Stars.
+    Создаёт таблицу заказов Telegram Stars.
     """
 
     db.execute(
@@ -476,22 +530,7 @@ def _ensure_xtr_orders_table() -> None:
     )
 
 
-def create_xtr_invoice(
-    bot,
-    chat_id: int,
-    user_id: int,
-    product_id: int,
-):
-    """
-    Создаёт Telegram Stars invoice.
-
-    Оплата доступна только товарам категории other
-    с fulfillment_mode='xtr'.
-    """
-
-    user_id = _uid(user_id)
-    product_id = _positive(product_id, "ID товара")
-
+def _get_xtr_product(product_id: int):
     product = shop.get_product(product_id)
 
     if not product:
@@ -505,10 +544,28 @@ def create_xtr_invoice(
     if product.get("fulfillment_mode") != "xtr":
         raise ValueError("Этот товар не продаётся за Telegram Stars")
 
-    amount = int(product.get("price_xtr") or 0)
+    amount = _positive(
+        product.get("price_xtr"),
+        "Цена товара в Stars",
+    )
 
-    if amount <= 0:
-        raise ValueError("Некорректная цена товара в Stars")
+    return product, amount
+
+
+def create_xtr_invoice(
+    bot,
+    chat_id: int,
+    user_id: int,
+    product_id: int,
+):
+    """
+    Создаёт счёт Telegram Stars.
+    """
+
+    user_id = _uid(user_id)
+    product_id = _positive(product_id, "ID товара")
+
+    product, amount = _get_xtr_product(product_id)
 
     _ensure_xtr_orders_table()
 
@@ -518,7 +575,10 @@ def create_xtr_invoice(
     timestamp = db.now()
 
     with db.transaction():
-        payment_cursor = db.execute(
+        if not db.get_user(user_id):
+            raise ValueError("Пользователь не найден")
+
+        cursor = db.execute(
             """
             INSERT INTO payments(
                 user_id,
@@ -532,8 +592,10 @@ def create_xtr_invoice(
                 created_at,
                 updated_at
             )
-            VALUES (?, NULL, 'product', 'telegram_stars',
-                    ?, 'XTR', 'pending', ?, ?, ?)
+            VALUES (
+                ?, NULL, 'product', 'telegram_stars',
+                ?, 'XTR', 'pending', ?, ?, ?
+            )
             """,
             (
                 user_id,
@@ -544,7 +606,7 @@ def create_xtr_invoice(
             ),
         )
 
-        payment_id = payment_cursor.lastrowid
+        payment_id = cursor.lastrowid
 
     try:
         import telebot
@@ -575,10 +637,12 @@ def create_xtr_invoice(
                 UPDATE payments
                 SET status = 'failed',
                     updated_at = ?
-                WHERE id = ? AND status = 'pending'
+                WHERE id = ?
+                  AND status = 'pending'
                 """,
                 (db.now(), payment_id),
             )
+
         raise
 
     return {
@@ -596,21 +660,38 @@ def validate_xtr_pre_checkout(
     total_amount: int,
 ) -> tuple[bool, str]:
     """
-    Проверяет данные Telegram pre_checkout_query.
+    Проверяет запрос Telegram перед оплатой.
     """
 
-    user_id = _uid(user_id)
+    try:
+        user_id = _uid(user_id)
+        total_amount = _positive(total_amount, "Сумма")
+    except ValueError as exc:
+        return False, str(exc)
+
+    payload = str(payload or "").strip()
 
     if currency != "XTR":
         return False, "Неверная валюта платежа"
 
-    try:
-        total_amount = int(total_amount)
-    except (TypeError, ValueError):
-        return False, "Неверная сумма платежа"
+    parts = payload.split(":")
 
-    if total_amount <= 0:
-        return False, "Неверная сумма платежа"
+    if (
+        len(parts) != 5
+        or parts[0] != "gss"
+        or parts[1] != "xtr"
+        or not parts[4]
+    ):
+        return False, "Некорректные данные платежа"
+
+    try:
+        payload_user_id = int(parts[2])
+        product_id = _positive(parts[3], "ID товара")
+    except (TypeError, ValueError):
+        return False, "Некорректные данные платежа"
+
+    if payload_user_id != user_id:
+        return False, "Пользователь не совпадает"
 
     payment = db.fetchone(
         """
@@ -622,7 +703,7 @@ def validate_xtr_pre_checkout(
           AND currency = 'XTR'
           AND status = 'pending'
         """,
-        (str(payload), user_id),
+        (payload, user_id),
     )
 
     if not payment:
@@ -631,32 +712,12 @@ def validate_xtr_pre_checkout(
     if int(payment["amount"]) != total_amount:
         return False, "Сумма платежа не совпадает"
 
-    parts = str(payload).split(":")
-
-    if len(parts) != 5 or parts[0] != "gss" or parts[1] != "xtr":
-        return False, "Некорректные данные платежа"
-
     try:
-        payload_user_id = int(parts[2])
-        product_id = int(parts[3])
-    except (TypeError, ValueError):
-        return False, "Некорректные данные платежа"
-
-    if payload_user_id != user_id:
-        return False, "Пользователь не совпадает"
-
-    product = shop.get_product(product_id)
-
-    if not product:
+        product, current_price = _get_xtr_product(product_id)
+    except (ValueError, TypeError):
         return False, "Товар больше недоступен"
 
-    if product.get("category_slug") != "other":
-        return False, "Неверная категория товара"
-
-    if product.get("fulfillment_mode") != "xtr":
-        return False, "Неверный способ оплаты"
-
-    if int(product.get("price_xtr") or 0) != total_amount:
+    if current_price != total_amount:
         return False, "Цена товара изменилась"
 
     return True, ""
@@ -672,13 +733,17 @@ def process_xtr_success(
     """
     Обрабатывает успешный платёж Telegram Stars.
 
-    Проверяет пользователя, товар, сумму, валюту,
-    уникальность Telegram charge ID и статус платежа.
+    Повторный вызов с тем же charge ID возвращает
+    существующий заказ, не создавая новый.
     """
 
     user_id = _uid(user_id)
     total_amount = _positive(total_amount, "Сумма")
-    telegram_charge_id = str(telegram_charge_id or "").strip()
+
+    payload = str(payload or "").strip()
+    telegram_charge_id = str(
+        telegram_charge_id or ""
+    ).strip()
 
     if currency != "XTR":
         raise ValueError("Неверная валюта платежа")
@@ -686,24 +751,53 @@ def process_xtr_success(
     if not telegram_charge_id:
         raise ValueError("Отсутствует ID платежа Telegram")
 
-    valid, error = validate_xtr_pre_checkout(
-        user_id,
-        payload,
-        currency,
-        total_amount,
-    )
+    parts = payload.split(":")
 
-    if not valid:
-        raise ValueError(error)
+    if (
+        len(parts) != 5
+        or parts[0] != "gss"
+        or parts[1] != "xtr"
+        or not parts[4]
+    ):
+        raise ValueError("Некорректные данные платежа")
 
-    parts = str(payload).split(":")
-    product_id = int(parts[3])
+    try:
+        payload_user_id = int(parts[2])
+        product_id = _positive(parts[3], "ID товара")
+    except (TypeError, ValueError):
+        raise ValueError("Некорректные данные платежа")
+
+    if payload_user_id != user_id:
+        raise ValueError("Пользователь не совпадает")
 
     _ensure_xtr_orders_table()
 
     timestamp = db.now()
 
     with db.transaction():
+        # Повторная доставка одного и того же платежа.
+        existing_charge = db.fetchone(
+            """
+            SELECT *
+            FROM xtr_orders
+            WHERE telegram_charge_id = ?
+            """,
+            (telegram_charge_id,),
+        )
+
+        if existing_charge:
+            if (
+                int(existing_charge["user_id"]) == user_id
+                and int(existing_charge["product_id"]) == product_id
+                and int(existing_charge["amount_xtr"]) == total_amount
+                and existing_charge["currency"] == currency
+            ):
+                return _dict(existing_charge)
+
+            raise ValueError(
+                "Этот Telegram charge ID уже использован"
+            )
+
         payment = db.fetchone(
             """
             SELECT *
@@ -718,33 +812,25 @@ def process_xtr_success(
         if not payment:
             raise ValueError("Платёж не найден")
 
-        if payment["status"] == "paid":
-            existing = db.fetchone(
-                """
-                SELECT *
-                FROM xtr_orders
-                WHERE telegram_charge_id = ?
-                """,
-                (telegram_charge_id,),
-            )
-
-            if existing:
-                return _dict(existing)
-
-            raise ValueError("Платёж уже обработан")
-
         if payment["status"] != "pending":
-            raise ValueError("Платёж больше не ожидает подтверждения")
+            raise ValueError("Платёж уже обработан или отменён")
 
         if int(payment["amount"]) != total_amount:
             raise ValueError("Сумма платежа не совпадает")
 
+        if payment["currency"] != currency:
+            raise ValueError("Валюта платежа не совпадает")
+
         product = db.fetchone(
             """
-            SELECT p.*, c.slug AS category_slug
+            SELECT
+                p.*,
+                c.slug AS category_slug
             FROM products p
-            LEFT JOIN categories c ON c.id = p.category_id
-            WHERE p.id = ? AND p.active = 1
+            LEFT JOIN categories c
+                ON c.id = p.category_id
+            WHERE p.id = ?
+              AND p.active = 1
             """,
             (product_id,),
         )
@@ -761,6 +847,7 @@ def process_xtr_success(
         if int(product["price_xtr"]) != total_amount:
             raise ValueError("Цена товара изменилась")
 
+        # Уменьшаем остаток только при наличии ограничения.
         if product["stock"] is not None:
             if int(product["stock"]) < 1:
                 raise ValueError("Товар закончился")
@@ -770,7 +857,9 @@ def process_xtr_success(
                 UPDATE products
                 SET stock = stock - 1,
                     updated_at = ?
-                WHERE id = ? AND stock >= 1
+                WHERE id = ?
+                  AND active = 1
+                  AND stock >= 1
                 """,
                 (timestamp, product_id),
             )
@@ -813,7 +902,8 @@ def process_xtr_success(
                 telegram_charge_id = ?,
                 provider_payment_id = ?,
                 updated_at = ?
-            WHERE id = ? AND status = 'pending'
+            WHERE id = ?
+              AND status = 'pending'
             """,
             (
                 telegram_charge_id,
@@ -828,7 +918,11 @@ def process_xtr_success(
 
         return _dict(
             db.fetchone(
-                "SELECT * FROM xtr_orders WHERE id = ?",
+                """
+                SELECT *
+                FROM xtr_orders
+                WHERE id = ?
+                """,
                 (order_id,),
             )
         )
@@ -864,9 +958,15 @@ def get_user_xtr_orders(
 
 new_topup = create_topup
 submit_topup_receipt = attach_topup_receipt
+
 confirm_topup = approve_topup
 decline_topup = reject_topup
+
+approve_topup_once = approve_topup
+reject_topup_once = reject_topup
+
 pending_topups = get_pending_topups
+
 create_stars_invoice = create_xtr_invoice
 check_pre_checkout = validate_xtr_pre_checkout
 successful_stars_payment = process_xtr_success
