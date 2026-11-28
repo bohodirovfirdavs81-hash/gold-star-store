@@ -2,17 +2,16 @@
 """
 Gold Star Store — база данных.
 
-SQLite, WAL, безопасные транзакции, миграции.
-Не удаляет существующие данные.
-Не обнуляет кошельки.
-Не добавляет демонстрационные товары.
+SQLite, WAL, вложенные транзакции и безопасные миграции.
+Существующие данные и балансы не удаляются и не обнуляются.
+Демонстрационные товары не создаются.
 """
 
+import json
 import os
 import sqlite3
 import threading
 import time
-import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -21,12 +20,20 @@ import config
 
 
 _LOCAL = threading.local()
+SCHEMA_VERSION = "3"
 
 
 def _database_path() -> str:
     path = getattr(config, "DATABASE_PATH", None)
+
     if not path:
         path = os.getenv("DATABASE_PATH", "gold_star.db")
+
+    path = str(path).strip()
+
+    if not path:
+        path = "gold_star.db"
+
     return os.path.abspath(path)
 
 
@@ -39,7 +46,7 @@ def _connect() -> sqlite3.Connection:
 
     conn = sqlite3.connect(
         path,
-        timeout=30,
+        timeout=30.0,
         isolation_level=None,
         check_same_thread=False,
     )
@@ -79,12 +86,14 @@ def close_connection() -> None:
 def transaction(immediate: bool = True):
     """
     Транзакция с поддержкой вложенных вызовов.
+
+    Внешняя транзакция использует BEGIN IMMEDIATE.
+    Вложенные транзакции используют SAVEPOINT.
     """
 
     conn = get_connection()
     depth = getattr(_LOCAL, "transaction_depth", 0)
-
-    savepoint = f"sp_{depth}"
+    savepoint = f"gss_sp_{depth}"
 
     try:
         if depth == 0:
@@ -103,12 +112,20 @@ def transaction(immediate: bool = True):
         else:
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
 
-    except Exception:
-        if depth == 0:
+    except BaseException:
+        try:
+            if depth == 0:
+                conn.rollback()
+            else:
+                conn.execute(
+                    f"ROLLBACK TO SAVEPOINT {savepoint}"
+                )
+                conn.execute(
+                    f"RELEASE SAVEPOINT {savepoint}"
+                )
+        except sqlite3.Error:
             conn.rollback()
-        else:
-            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+
         raise
 
     finally:
@@ -140,17 +157,61 @@ def _columns(table: str) -> set[str]:
     return {row["name"] for row in rows}
 
 
-def _add_column(table: str, name: str, definition: str) -> None:
+def _add_column(
+    table: str,
+    name: str,
+    definition: str,
+) -> None:
     if name not in _columns(table):
         execute(
             f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
         )
 
 
+def _ensure_columns(
+    migrations: dict[str, list[tuple[str, str]]],
+) -> None:
+    for table, columns in migrations.items():
+        for name, definition in columns:
+            _add_column(table, name, definition)
+
+
+def _backfill_timestamps() -> None:
+    timestamp = now()
+
+    for table, columns in {
+        "users": ("created_at", "updated_at"),
+        "categories": ("created_at",),
+        "products": ("created_at", "updated_at"),
+        "cart_items": ("created_at", "updated_at"),
+        "wallets": ("updated_at",),
+        "topups": ("created_at", "updated_at"),
+        "wallet_orders": ("created_at", "updated_at"),
+        "legacy_orders": ("created_at", "updated_at"),
+        "payments": ("created_at", "updated_at"),
+    }.items():
+        existing = _columns(table)
+
+        for column in columns:
+            if column in existing:
+                execute(
+                    f"""
+                    UPDATE {table}
+                    SET {column} = ?
+                    WHERE {column} IS NULL OR {column} = ''
+                    """,
+                    (timestamp,),
+                )
+
+
 def init_db() -> None:
     """
     Создаёт отсутствующие таблицы и выполняет
-    безопасные добавочные миграции.
+    добавочные миграции без удаления существующих данных.
+
+    Важно: executescript вызывается вне transaction(),
+    поскольку SQLite может автоматически завершить
+    активную транзакцию при выполнении executescript.
     """
 
     schema = """
@@ -203,7 +264,8 @@ def init_db() -> None:
         sort_order INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        FOREIGN KEY(category_id) REFERENCES categories(id)
+        FOREIGN KEY(category_id)
+            REFERENCES categories(id)
             ON DELETE SET NULL
     );
 
@@ -216,9 +278,11 @@ def init_db() -> None:
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(user_id, product_id),
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE CASCADE,
-        FOREIGN KEY(product_id) REFERENCES products(id)
+        FOREIGN KEY(product_id)
+            REFERENCES products(id)
             ON DELETE RESTRICT
     );
 
@@ -227,7 +291,8 @@ def init_db() -> None:
         balance_uzs INTEGER NOT NULL DEFAULT 0,
         bonus_uzs INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE CASCADE,
         CHECK(balance_uzs >= 0),
         CHECK(bonus_uzs >= 0)
@@ -246,7 +311,8 @@ def init_db() -> None:
         reference_id TEXT,
         description TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE RESTRICT
     );
 
@@ -264,7 +330,8 @@ def init_db() -> None:
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         confirmed_at TEXT,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE RESTRICT
     );
 
@@ -284,9 +351,11 @@ def init_db() -> None:
         admin_comment TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE RESTRICT,
-        FOREIGN KEY(product_id) REFERENCES products(id)
+        FOREIGN KEY(product_id)
+            REFERENCES products(id)
             ON DELETE RESTRICT
     );
 
@@ -297,7 +366,8 @@ def init_db() -> None:
         total_uzs INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE RESTRICT
     );
 
@@ -308,7 +378,8 @@ def init_db() -> None:
         product_title TEXT NOT NULL,
         qty INTEGER NOT NULL DEFAULT 1,
         unit_price_uzs INTEGER NOT NULL DEFAULT 0,
-        FOREIGN KEY(order_id) REFERENCES legacy_orders(id)
+        FOREIGN KEY(order_id)
+            REFERENCES legacy_orders(id)
             ON DELETE CASCADE
     );
 
@@ -326,7 +397,8 @@ def init_db() -> None:
         payload TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+        FOREIGN KEY(user_id)
+            REFERENCES users(telegram_id)
             ON DELETE RESTRICT
     );
 
@@ -368,67 +440,159 @@ def init_db() -> None:
     );
     """
 
+    conn = get_connection()
+    conn.executescript(schema)
+
+    migrations = {
+        "users": [
+            ("username", "TEXT"),
+            ("first_name", "TEXT"),
+            ("last_name", "TEXT"),
+            ("language_code", "TEXT"),
+            ("is_premium", "INTEGER NOT NULL DEFAULT 0"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ],
+        "categories": [
+            ("slug", "TEXT"),
+            ("title", "TEXT"),
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+            ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
+            ("active", "INTEGER NOT NULL DEFAULT 1"),
+            ("created_at", "TEXT"),
+        ],
+        "products": [
+            ("category_id", "INTEGER"),
+            ("sku", "TEXT"),
+            ("title", "TEXT"),
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+            ("price_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("price_xtr", "INTEGER NOT NULL DEFAULT 0"),
+            ("fulfillment_mode", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("active", "INTEGER NOT NULL DEFAULT 1"),
+            ("bonus_eligible", "INTEGER NOT NULL DEFAULT 1"),
+            ("stock", "INTEGER"),
+            ("image_url", "TEXT"),
+            ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ],
+        "cart_items": [
+            ("user_id", "INTEGER"),
+            ("product_id", "INTEGER"),
+            ("qty", "INTEGER NOT NULL DEFAULT 1"),
+            ("recipient", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ],
+        "wallets": [
+            ("balance_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("bonus_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("updated_at", "TEXT"),
+        ],
+        "wallet_transactions": [
+            ("user_id", "INTEGER"),
+            ("transaction_type", "TEXT NOT NULL DEFAULT 'adjustment'"),
+            ("amount_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("balance_delta", "INTEGER NOT NULL DEFAULT 0"),
+            ("bonus_delta", "INTEGER NOT NULL DEFAULT 0"),
+            ("balance_after", "INTEGER NOT NULL DEFAULT 0"),
+            ("bonus_after", "INTEGER NOT NULL DEFAULT 0"),
+            ("reference_type", "TEXT"),
+            ("reference_id", "TEXT"),
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT"),
+        ],
+        "topups": [
+            ("user_id", "INTEGER"),
+            ("amount_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("receipt_file_id", "TEXT"),
+            ("receipt_note", "TEXT NOT NULL DEFAULT ''"),
+            ("admin_id", "INTEGER"),
+            ("admin_comment", "TEXT NOT NULL DEFAULT ''"),
+            ("payment_reference", "TEXT"),
+            ("idempotency_key", "TEXT"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+            ("confirmed_at", "TEXT"),
+        ],
+        "wallet_orders": [
+            ("user_id", "INTEGER"),
+            ("product_id", "INTEGER"),
+            ("product_title", "TEXT"),
+            ("qty", "INTEGER NOT NULL DEFAULT 1"),
+            ("recipient", "TEXT NOT NULL DEFAULT ''"),
+            ("unit_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("total_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("bonus_used_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("balance_used_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("idempotency_key", "TEXT"),
+            ("admin_comment", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ],
+        "legacy_orders": [
+            ("user_id", "INTEGER"),
+            ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("total_uzs", "INTEGER NOT NULL DEFAULT 0"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ],
+        "legacy_order_items": [
+            ("order_id", "INTEGER"),
+            ("product_id", "INTEGER"),
+            ("product_title", "TEXT"),
+            ("qty", "INTEGER NOT NULL DEFAULT 1"),
+            ("unit_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+        "payments": [
+            ("user_id", "INTEGER"),
+            ("order_id", "INTEGER"),
+            ("payment_type", "TEXT"),
+            ("provider", "TEXT"),
+            ("amount", "INTEGER NOT NULL DEFAULT 0"),
+            ("currency", "TEXT"),
+            ("status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("provider_payment_id", "TEXT"),
+            ("telegram_charge_id", "TEXT"),
+            ("payload", "TEXT"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+        ],
+        "admin_audit_log": [
+            ("admin_id", "INTEGER"),
+            ("action", "TEXT"),
+            ("target_type", "TEXT"),
+            ("target_id", "TEXT"),
+            ("details", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "TEXT"),
+        ],
+        "rate_limit_events": [
+            ("event_key", "TEXT"),
+            ("created_at", "REAL"),
+        ],
+        "used_init_nonces": [
+            ("user_id", "INTEGER"),
+            ("created_at", "REAL"),
+        ],
+        "fsm_states": [
+            ("state", "TEXT"),
+            ("data", "TEXT NOT NULL DEFAULT '{}'"),
+            ("updated_at", "TEXT"),
+        ],
+        "inbox_updates": [
+            ("status", "TEXT NOT NULL DEFAULT 'received'"),
+            ("received_at", "TEXT"),
+            ("processed_at", "TEXT"),
+            ("error", "TEXT"),
+        ],
+    }
+
     with transaction():
-        conn = get_connection()
-        conn.executescript(schema)
-
-        # Добавочные миграции для ранее созданных таблиц.
-        migrations = {
-            "users": [
-                ("username", "TEXT"),
-                ("first_name", "TEXT"),
-                ("last_name", "TEXT"),
-                ("language_code", "TEXT"),
-                ("is_premium", "INTEGER NOT NULL DEFAULT 0"),
-                ("created_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ],
-            "products": [
-                ("category_id", "INTEGER"),
-                ("sku", "TEXT"),
-                ("description", "TEXT NOT NULL DEFAULT ''"),
-                ("price_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("price_xtr", "INTEGER NOT NULL DEFAULT 0"),
-                ("fulfillment_mode", "TEXT NOT NULL DEFAULT 'manual'"),
-                ("active", "INTEGER NOT NULL DEFAULT 1"),
-                ("bonus_eligible", "INTEGER NOT NULL DEFAULT 1"),
-                ("stock", "INTEGER"),
-                ("image_url", "TEXT"),
-                ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
-                ("created_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ],
-            "wallets": [
-                ("balance_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("bonus_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("updated_at", "TEXT"),
-            ],
-            "topups": [
-                ("receipt_file_id", "TEXT"),
-                ("receipt_note", "TEXT NOT NULL DEFAULT ''"),
-                ("admin_id", "INTEGER"),
-                ("admin_comment", "TEXT NOT NULL DEFAULT ''"),
-                ("payment_reference", "TEXT"),
-                ("idempotency_key", "TEXT"),
-                ("confirmed_at", "TEXT"),
-                ("updated_at", "TEXT"),
-            ],
-            "wallet_orders": [
-                ("qty", "INTEGER NOT NULL DEFAULT 1"),
-                ("recipient", "TEXT NOT NULL DEFAULT ''"),
-                ("unit_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("total_price_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("bonus_used_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("balance_used_uzs", "INTEGER NOT NULL DEFAULT 0"),
-                ("idempotency_key", "TEXT"),
-                ("admin_comment", "TEXT NOT NULL DEFAULT ''"),
-                ("updated_at", "TEXT"),
-            ],
-        }
-
-        for table, columns in migrations.items():
-            for name, definition in columns:
-                _add_column(table, name, definition)
+        _ensure_columns(migrations)
+        _backfill_timestamps()
 
         indexes = [
             """
@@ -472,24 +636,26 @@ def init_db() -> None:
         ]
 
         for sql in indexes:
-            conn.execute(sql)
+            execute(sql)
 
-        conn.execute(
+        execute(
             """
             INSERT INTO schema_state(key, value, updated_at)
-            VALUES('database_version', '2', ?)
+            VALUES('database_version', ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value,
                 updated_at = excluded.updated_at
             """,
-            (now(),),
+            (SCHEMA_VERSION, now()),
         )
 
 
 def upsert_user(tg_user: dict[str, Any]) -> None:
     """
-    Сохраняет пользователя Telegram WebApp.
-    Принимает словарь user из проверенного initData.
+    Сохраняет пользователя Telegram.
+
+    Не изменяет баланс существующего пользователя.
+    Для нового пользователя создаёт пустой кошелёк.
     """
 
     if not isinstance(tg_user, dict):
@@ -506,8 +672,14 @@ def upsert_user(tg_user: dict[str, Any]) -> None:
         execute(
             """
             INSERT INTO users(
-                telegram_id, username, first_name, last_name,
-                language_code, is_premium, created_at, updated_at
+                telegram_id,
+                username,
+                first_name,
+                last_name,
+                language_code,
+                is_premium,
+                created_at,
+                updated_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET
@@ -533,7 +705,10 @@ def upsert_user(tg_user: dict[str, Any]) -> None:
         execute(
             """
             INSERT OR IGNORE INTO wallets(
-                user_id, balance_uzs, bonus_uzs, updated_at
+                user_id,
+                balance_uzs,
+                bonus_uzs,
+                updated_at
             )
             VALUES (?, 0, 0, ?)
             """,
@@ -573,7 +748,10 @@ def check_and_record_rate_limit(
 
     with transaction():
         execute(
-            "DELETE FROM rate_limit_events WHERE created_at < ?",
+            """
+            DELETE FROM rate_limit_events
+            WHERE created_at < ?
+            """,
             (current - 86400,),
         )
 
@@ -581,7 +759,8 @@ def check_and_record_rate_limit(
             """
             SELECT COUNT(*) AS total
             FROM rate_limit_events
-            WHERE event_key = ? AND created_at >= ?
+            WHERE event_key = ?
+              AND created_at >= ?
             """,
             (key, cutoff),
         )
@@ -600,9 +779,11 @@ def check_and_record_rate_limit(
     return True
 
 
-def mark_init_nonce_used(nonce: str, user_id: int | None = None) -> bool:
+def mark_init_nonce_used(
+    nonce: str,
+    user_id: int | None = None,
+) -> bool:
     """
-    Защита от повторного использования nonce.
     True — nonce записан впервые.
     False — nonce уже использовался.
     """
@@ -614,21 +795,31 @@ def mark_init_nonce_used(nonce: str, user_id: int | None = None) -> bool:
         with transaction():
             execute(
                 """
-                INSERT INTO used_init_nonces(nonce, user_id, created_at)
+                INSERT INTO used_init_nonces(
+                    nonce,
+                    user_id,
+                    created_at
+                )
                 VALUES (?, ?, ?)
                 """,
                 (nonce, user_id, time.time()),
             )
+
         return True
+
     except sqlite3.IntegrityError:
         return False
 
 
-def get_setting(key: str, default: str | None = None):
+def get_setting(
+    key: str,
+    default: str | None = None,
+):
     row = fetchone(
         "SELECT value FROM settings WHERE key = ?",
         (key,),
     )
+
     return row["value"] if row else default
 
 
@@ -664,8 +855,12 @@ def record_admin_action(
         execute(
             """
             INSERT INTO admin_audit_log(
-                admin_id, action, target_type, target_id,
-                details, created_at
+                admin_id,
+                action,
+                target_type,
+                target_id,
+                details,
+                created_at
             )
             VALUES (?, ?, ?, ?, ?, ?)
             """,
@@ -680,11 +875,14 @@ def record_admin_action(
         )
 
 
-# Совместимость с вариантами названий,
-# используемыми в других модулях проекта.
+# Совместимость с другими модулями проекта.
+
 db = get_connection
+tx = transaction
+
 query_one = fetchone
 query_all = fetchall
+
 q_one = fetchone
 q_all = fetchall
 q_exec = execute
