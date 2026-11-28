@@ -26,6 +26,7 @@ import database as db
 import shop
 import payments
 import admin
+import api
 
 from utils import (
     bot,
@@ -52,6 +53,15 @@ logger = logging.getLogger("goldstar.bot")
 
 
 # ---------------------------------------------------------
+# TELEGRAM BOT
+# ---------------------------------------------------------
+
+# Webhook обрабатывается последовательно.
+# Это позволяет дождаться выполнения обработчиков.
+bot.threaded = False
+
+
+# ---------------------------------------------------------
 # FLASK
 # ---------------------------------------------------------
 
@@ -65,7 +75,7 @@ app.config["SECRET_KEY"] = (
     config.FLASK_SECRET_KEY or secrets.token_hex(32)
 )
 
-app.register_blueprint(__import__("api").api)
+app.register_blueprint(api.api)
 
 
 # ---------------------------------------------------------
@@ -165,15 +175,12 @@ def notify_admins(text, reply_markup=None):
 
 
 def ask_for_topup_receipt(message, topup_id):
-    """
-    Повторно запрашивает чек и регистрирует следующий шаг.
-    """
-
     prompt = bot.send_message(
         message.chat.id,
         (
             f"Заявка №{topup_id} ожидает чек.\n\n"
-            "Отправьте фотографию или документ с подтверждением перевода."
+            "Отправьте фотографию или документ "
+            "с подтверждением перевода."
         ),
         reply_markup=types.ForceReply(
             selective=True,
@@ -206,6 +213,7 @@ def start_handler(message):
             message.from_user.id,
             message.text,
         )
+
         db.upsert_user(
             get_user_info(message.from_user)
         )
@@ -213,8 +221,8 @@ def start_handler(message):
         text = (
             f"⭐ <b>{h(config.BRAND)}</b>\n\n"
             "Добро пожаловать в магазин!\n\n"
-            "Здесь можно просматривать товары, оформлять заказы "
-            "и управлять кошельком.\n\n"
+            "Здесь можно просматривать товары, оформлять "
+            "заказы и управлять кошельком.\n\n"
             "Для открытия магазина нажмите кнопку ниже."
         )
 
@@ -225,13 +233,23 @@ def start_handler(message):
             disable_web_page_preview=True,
         )
 
+        logger.info(
+            "Ответ /start отправлен: user_id=%s",
+            message.from_user.id,
+        )
+
     except Exception:
         logger.exception("Ошибка команды start")
 
-        bot.send_message(
-            message.chat.id,
-            "Не удалось открыть магазин. Попробуйте позже.",
-        )
+        try:
+            bot.send_message(
+                message.chat.id,
+                "Не удалось открыть магазин. Попробуйте позже.",
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось отправить сообщение об ошибке /start"
+            )
 
 
 @bot.message_handler(commands=["help"])
@@ -272,15 +290,8 @@ def profile_handler(message):
             )
             return
 
-        balance = (
-            wallet["balance_uzs"]
-            if wallet else 0
-        )
-
-        bonus = (
-            wallet["bonus_uzs"]
-            if wallet else 0
-        )
+        balance = wallet["balance_uzs"] if wallet else 0
+        bonus = wallet["bonus_uzs"] if wallet else 0
 
         bot.send_message(
             message.chat.id,
@@ -469,14 +480,8 @@ def process_topup_receipt(message, topup_id):
         )
 
         markup = kb([[
-            btn(
-                "Подтвердить",
-                f"topup:approve:{topup_id}",
-            ),
-            btn(
-                "Отклонить",
-                f"topup:reject:{topup_id}",
-            ),
+            btn("Подтвердить", f"topup:approve:{topup_id}"),
+            btn("Отклонить", f"topup:reject:{topup_id}"),
         ]])
 
         sent = 0
@@ -576,8 +581,6 @@ def admin_handler(message):
     try:
         stats = admin.get_stats(admin_id)
 
-        # Поддерживаем оба названия поля,
-        # чтобы не ломать совместимость admin.py.
         completed_orders = stats.get(
             "paid_orders",
             stats.get("delivered_orders", 0),
@@ -590,12 +593,9 @@ def admin_handler(message):
             f"Ожидающих пополнений: {stats['pending_topups']}\n"
             f"Ожидающих заказов: {stats['pending_orders']}\n"
             f"Завершённых заказов: {completed_orders}\n\n"
-            f"Баланс пользователей: "
-            f"{uzs(stats['wallet_balance_uzs'])}\n"
-            f"Бонусы пользователей: "
-            f"{uzs(stats['wallet_bonus_uzs'])}\n"
-            f"Подтверждённые пополнения: "
-            f"{uzs(stats['approved_topups_uzs'])}"
+            f"Баланс пользователей: {uzs(stats['wallet_balance_uzs'])}\n"
+            f"Бонусы пользователей: {uzs(stats['wallet_bonus_uzs'])}\n"
+            f"Подтверждённые пополнения: {uzs(stats['approved_topups_uzs'])}"
         )
 
         markup = kb([
@@ -627,11 +627,7 @@ def admin_callback(call):
     admin_id = call.from_user.id
 
     if not is_admin(admin_id):
-        safe_answer(
-            call.id,
-            "Доступ запрещён",
-            True,
-        )
+        safe_answer(call.id, "Доступ запрещён", True)
         return
 
     try:
@@ -661,11 +657,9 @@ def admin_callback(call):
                 topup_id = row["id"]
 
                 text += (
-                    f"#{topup_id} — "
-                    f"{uzs(row['amount_uzs'])}\n"
+                    f"#{topup_id} — {uzs(row['amount_uzs'])}\n"
                     f"Пользователь: {row['user_id']}\n"
-                    f"Чек: "
-                    f"{'есть' if row['receipt_file_id'] else 'нет'}\n\n"
+                    f"Чек: {'есть' if row['receipt_file_id'] else 'нет'}\n\n"
                 )
 
                 buttons.append([
@@ -675,27 +669,16 @@ def admin_callback(call):
                     )
                 ])
 
-            buttons.append([
-                btn("Назад", "admin:home")
-            ])
+            buttons.append([btn("Назад", "admin:home")])
 
-            show(
-                call,
-                text,
-                kb(buttons),
-            )
+            show(call, text, kb(buttons))
 
         elif action == "topup":
             topup_id = int(parts[2])
-
             row = payments.get_topup(topup_id)
 
             if not row:
-                safe_answer(
-                    call.id,
-                    "Заявка не найдена",
-                    True,
-                )
+                safe_answer(call.id, "Заявка не найдена", True)
                 return
 
             text = (
@@ -703,36 +686,20 @@ def admin_callback(call):
                 f"Пользователь: {row['user_id']}\n"
                 f"Сумма: {uzs(row['amount_uzs'])}\n"
                 f"Статус: {h(row['status'])}\n"
-                f"Чек: "
-                f"{'есть' if row['receipt_file_id'] else 'нет'}"
+                f"Чек: {'есть' if row['receipt_file_id'] else 'нет'}"
             )
 
             buttons = []
 
-            if (
-                row["receipt_file_id"]
-                and row["status"] == "pending"
-            ):
+            if row["receipt_file_id"] and row["status"] == "pending":
                 buttons.append([
-                    btn(
-                        "Подтвердить",
-                        f"topup:approve:{topup_id}",
-                    ),
-                    btn(
-                        "Отклонить",
-                        f"topup:reject:{topup_id}",
-                    ),
+                    btn("Подтвердить", f"topup:approve:{topup_id}"),
+                    btn("Отклонить", f"topup:reject:{topup_id}"),
                 ])
 
-            buttons.append([
-                btn("Назад", "admin:topups")
-            ])
+            buttons.append([btn("Назад", "admin:topups")])
 
-            show(
-                call,
-                text,
-                kb(buttons),
-            )
+            show(call, text, kb(buttons))
 
         elif action == "orders":
             rows = admin.get_orders(
@@ -768,15 +735,8 @@ def admin_callback(call):
                     )
                 ])
 
-            buttons.append([
-                btn("Назад", "admin:home")
-            ])
-
-            show(
-                call,
-                text,
-                kb(buttons),
-            )
+            buttons.append([btn("Назад", "admin:home")])
+            show(call, text, kb(buttons))
 
         elif action == "order":
             order_id = int(parts[2])
@@ -787,11 +747,7 @@ def admin_callback(call):
             )
 
             if not row:
-                safe_answer(
-                    call.id,
-                    "Заказ не найден",
-                    True,
-                )
+                safe_answer(call.id, "Заказ не найден", True)
                 return
 
             text = (
@@ -800,10 +756,8 @@ def admin_callback(call):
                 f"Товар: {h(row['product_title'])}\n"
                 f"Количество: {row['qty']}\n"
                 f"Сумма: {uzs(row['total_price_uzs'])}\n"
-                f"Баланс использован: "
-                f"{uzs(row['balance_used_uzs'])}\n"
-                f"Бонусы использованы: "
-                f"{uzs(row['bonus_used_uzs'])}\n"
+                f"Баланс использован: {uzs(row['balance_used_uzs'])}\n"
+                f"Бонусы использованы: {uzs(row['bonus_used_uzs'])}\n"
                 f"Статус: {h(row['status'])}"
             )
 
@@ -811,50 +765,20 @@ def admin_callback(call):
 
             if row["status"] in ("paid", "processing"):
                 buttons.extend([
-                    [
-                        btn(
-                            "В обработку",
-                            f"admin:orderstatus:{order_id}:processing",
-                        )
-                    ],
-                    [
-                        btn(
-                            "Выдан",
-                            f"admin:orderstatus:{order_id}:delivered",
-                        )
-                    ],
-                    [
-                        btn(
-                            "Отклонить и вернуть средства",
-                            f"admin:orderstatus:{order_id}:rejected",
-                        )
-                    ],
+                    [btn("В обработку", f"admin:orderstatus:{order_id}:processing")],
+                    [btn("Выдан", f"admin:orderstatus:{order_id}:delivered")],
+                    [btn("Отклонить и вернуть средства", f"admin:orderstatus:{order_id}:rejected")],
                 ])
 
-            buttons.append([
-                btn("Назад", "admin:orders")
-            ])
-
-            show(
-                call,
-                text,
-                kb(buttons),
-            )
+            buttons.append([btn("Назад", "admin:orders")])
+            show(call, text, kb(buttons))
 
         elif action == "orderstatus":
             order_id = int(parts[2])
             status = parts[3]
 
-            if status not in (
-                "processing",
-                "delivered",
-                "rejected",
-            ):
-                safe_answer(
-                    call.id,
-                    "Недопустимый статус",
-                    True,
-                )
+            if status not in ("processing", "delivered", "rejected"):
+                safe_answer(call.id, "Недопустимый статус", True)
                 return
 
             admin.change_order_status(
@@ -864,10 +788,7 @@ def admin_callback(call):
                 "Изменено через Telegram",
             )
 
-            row = admin.get_order_details(
-                admin_id,
-                order_id,
-            )
+            row = admin.get_order_details(admin_id, order_id)
 
             if row:
                 actual_status = row["status"]
@@ -899,7 +820,6 @@ def admin_callback(call):
                         [btn("В панель", "admin:home")],
                     ]),
                 )
-
             else:
                 show(
                     call,
@@ -908,11 +828,7 @@ def admin_callback(call):
                 )
 
         elif action == "users":
-            rows = admin.get_users(
-                admin_id,
-                limit=15,
-            )
-
+            rows = admin.get_users(admin_id, limit=15)
             text = "<b>Последние пользователи</b>\n\n"
 
             for row in rows:
@@ -950,25 +866,14 @@ def admin_callback(call):
             )
 
         else:
-            safe_answer(
-                call.id,
-                "Неизвестное действие",
-                True,
-            )
+            safe_answer(call.id, "Неизвестное действие", True)
             return
 
         safe_answer(call.id)
 
     except Exception:
-        logger.exception(
-            "Ошибка callback администратора"
-        )
-
-        safe_answer(
-            call.id,
-            "Не удалось выполнить действие",
-            True,
-        )
+        logger.exception("Ошибка callback администратора")
+        safe_answer(call.id, "Не удалось выполнить действие", True)
 
 
 # ---------------------------------------------------------
@@ -981,16 +886,11 @@ def admin_callback(call):
 )
 def topup_admin_callback(call):
     if not is_admin(call.from_user.id):
-        safe_answer(
-            call.id,
-            "Доступ запрещён",
-            True,
-        )
+        safe_answer(call.id, "Доступ запрещён", True)
         return
 
     try:
         _, action, raw_id = call.data.split(":")
-
         topup_id = int(raw_id)
 
         if action == "approve":
@@ -1008,15 +908,8 @@ def topup_admin_callback(call):
                 ),
             )
 
-            show(
-                call,
-                f"Пополнение №{topup_id} подтверждено.",
-            )
-
-            safe_answer(
-                call.id,
-                "Баланс пополнен",
-            )
+            show(call, f"Пополнение №{topup_id} подтверждено.")
+            safe_answer(call.id, "Баланс пополнен")
 
         elif action == "reject":
             result = admin.reject_topup(
@@ -1033,40 +926,18 @@ def topup_admin_callback(call):
                 ),
             )
 
-            show(
-                call,
-                f"Пополнение №{topup_id} отклонено.",
-            )
-
-            safe_answer(
-                call.id,
-                "Заявка отклонена",
-            )
+            show(call, f"Пополнение №{topup_id} отклонено.")
+            safe_answer(call.id, "Заявка отклонена")
 
         else:
-            safe_answer(
-                call.id,
-                "Неизвестное действие",
-                True,
-            )
+            safe_answer(call.id, "Неизвестное действие", True)
 
     except ValueError as exc:
-        safe_answer(
-            call.id,
-            str(exc),
-            True,
-        )
+        safe_answer(call.id, str(exc), True)
 
     except Exception:
-        logger.exception(
-            "Ошибка обработки пополнения"
-        )
-
-        safe_answer(
-            call.id,
-            "Не удалось обработать заявку",
-            True,
-        )
+        logger.exception("Ошибка обработки пополнения")
+        safe_answer(call.id, "Не удалось обработать заявку", True)
 
 
 # ---------------------------------------------------------
@@ -1099,31 +970,18 @@ def request_admin(message, request_type):
             )
 
     except Exception:
-        logger.exception(
-            "Ошибка создания заявки %s",
-            request_type,
-        )
-
-        bot.send_message(
-            message.chat.id,
-            "Не удалось отправить заявку.",
-        )
+        logger.exception("Ошибка создания заявки %s", request_type)
+        bot.send_message(message.chat.id, "Не удалось отправить заявку.")
 
 
 @bot.message_handler(commands=["premium"])
 def premium_handler(message):
-    request_admin(
-        message,
-        "Telegram Premium",
-    )
+    request_admin(message, "Telegram Premium")
 
 
 @bot.message_handler(commands=["gift"])
 def gift_handler(message):
-    request_admin(
-        message,
-        "Telegram Gifts",
-    )
+    request_admin(message, "Telegram Gifts")
 
 
 # ---------------------------------------------------------
@@ -1148,9 +1006,7 @@ def stars_handler(message):
             if product.get("fulfillment_mode") != "xtr":
                 continue
 
-            price = safe_int(
-                product.get("price_xtr")
-            )
+            price = safe_int(product.get("price_xtr"))
 
             if price <= 0:
                 continue
@@ -1179,14 +1035,8 @@ def stars_handler(message):
         )
 
     except Exception:
-        logger.exception(
-            "Ошибка списка Stars"
-        )
-
-        bot.send_message(
-            message.chat.id,
-            "Не удалось загрузить товары.",
-        )
+        logger.exception("Ошибка списка Stars")
+        bot.send_message(message.chat.id, "Не удалось загрузить товары.")
 
 
 @bot.callback_query_handler(
@@ -1195,16 +1045,10 @@ def stars_handler(message):
 )
 def stars_buy_callback(call):
     try:
-        product_id = int(
-            call.data.split(":")[2]
-        )
+        product_id = int(call.data.split(":")[2])
 
         if not call.message:
-            safe_answer(
-                call.id,
-                "Сообщение недоступно",
-                True,
-            )
+            safe_answer(call.id, "Сообщение недоступно", True)
             return
 
         db.upsert_user(
@@ -1218,28 +1062,14 @@ def stars_buy_callback(call):
             product_id=product_id,
         )
 
-        safe_answer(
-            call.id,
-            "Счёт создан",
-        )
+        safe_answer(call.id, "Счёт создан")
 
     except ValueError as exc:
-        safe_answer(
-            call.id,
-            str(exc),
-            True,
-        )
+        safe_answer(call.id, str(exc), True)
 
     except Exception:
-        logger.exception(
-            "Ошибка создания Stars invoice"
-        )
-
-        safe_answer(
-            call.id,
-            "Не удалось создать счёт",
-            True,
-        )
+        logger.exception("Ошибка создания Stars invoice")
+        safe_answer(call.id, "Не удалось создать счёт", True)
 
 
 @bot.pre_checkout_query_handler(
@@ -1257,15 +1087,11 @@ def pre_checkout_handler(query):
         bot.answer_pre_checkout_query(
             query.id,
             ok=valid,
-            error_message=(
-                None if valid else message
-            ),
+            error_message=None if valid else message,
         )
 
     except Exception:
-        logger.exception(
-            "Ошибка pre-checkout"
-        )
+        logger.exception("Ошибка pre-checkout")
 
         try:
             bot.answer_pre_checkout_query(
@@ -1274,9 +1100,7 @@ def pre_checkout_handler(query):
                 error_message="Не удалось проверить платёж",
             )
         except Exception:
-            logger.exception(
-                "Не удалось ответить на pre-checkout"
-            )
+            logger.exception("Не удалось ответить на pre-checkout")
 
 
 @bot.message_handler(
@@ -1284,10 +1108,7 @@ def pre_checkout_handler(query):
 )
 def successful_payment_handler(message):
     payment = message.successful_payment
-
-    charge_id = (
-        payment.telegram_payment_charge_id
-    )
+    charge_id = payment.telegram_payment_charge_id
 
     try:
         result = payments.process_xtr_success(
@@ -1319,9 +1140,7 @@ def successful_payment_handler(message):
         )
 
     except Exception:
-        logger.exception(
-            "Ошибка обработки успешной оплаты Stars"
-        )
+        logger.exception("Ошибка обработки успешной оплаты Stars")
 
         try:
             bot.send_message(
@@ -1329,24 +1148,19 @@ def successful_payment_handler(message):
                 (
                     "Telegram сообщил об успешной оплате, "
                     "но магазин не смог завершить обработку заказа.\n\n"
-                    "Не оплачивайте повторно. "
-                    "Обратитесь к администратору и укажите "
-                    "ID платежа."
+                    "Не оплачивайте повторно. Обратитесь к администратору "
+                    "и укажите ID платежа."
                 ),
             )
         except Exception:
-            logger.exception(
-                "Не удалось уведомить пользователя о проблеме Stars"
-            )
+            logger.exception("Не удалось уведомить пользователя о проблеме Stars")
 
         notify_admins(
             (
                 "<b>Требуется сверка платежа Stars</b>\n\n"
                 f"Пользователь: {message.from_user.id}\n"
-                f"Telegram charge ID:\n"
-                f"<code>{h(charge_id)}</code>\n"
-                f"Payload:\n"
-                f"<code>{h(payment.invoice_payload)}</code>\n"
+                f"Telegram charge ID:\n<code>{h(charge_id)}</code>\n"
+                f"Payload:\n<code>{h(payment.invoice_payload)}</code>\n"
                 f"Сумма: {payment.total_amount} {h(payment.currency)}\n\n"
                 "Проверьте платёж и состояние заказа в базе данных. "
                 "Не начисляйте средства повторно без проверки."
@@ -1363,10 +1177,7 @@ def telegram_webhook():
     expected_secret = config.WEBHOOK_SECRET
 
     if not expected_secret:
-        logger.error(
-            "WEBHOOK_SECRET не задан"
-        )
-
+        logger.error("WEBHOOK_SECRET не задан")
         return jsonify({
             "ok": False,
             "error": "Webhook secret is not configured",
@@ -1381,18 +1192,11 @@ def telegram_webhook():
         received_secret,
         expected_secret,
     ):
-        logger.warning(
-            "Webhook: неверный secret token"
-        )
-
-        return jsonify({
-            "ok": False,
-        }), 403
+        logger.warning("Webhook: неверный secret token")
+        return jsonify({"ok": False}), 403
 
     try:
-        update_data = request.get_json(
-            silent=True
-        )
+        update_data = request.get_json(silent=True)
 
         if not isinstance(update_data, dict):
             return jsonify({
@@ -1400,9 +1204,7 @@ def telegram_webhook():
                 "error": "Invalid JSON",
             }), 400
 
-        update = types.Update.de_json(
-            update_data
-        )
+        update = types.Update.de_json(update_data)
 
         if update is None or update.update_id is None:
             return jsonify({
@@ -1412,8 +1214,40 @@ def telegram_webhook():
 
         update_id = int(update.update_id)
 
-        # Записываем update_id до обработки.
-        # Повторно пришедшее обновление не запускаем второй раз.
+        update_type = next(
+            (
+                name
+                for name in (
+                    "message",
+                    "edited_message",
+                    "callback_query",
+                    "pre_checkout_query",
+                    "shipping_query",
+                )
+                if getattr(update, name, None) is not None
+            ),
+            "unknown",
+        )
+
+        logger.info(
+            "Получено обновление: id=%s, type=%s",
+            update_id,
+            update_type,
+        )
+
+        if update_type == "message":
+            incoming_message = update.message
+
+            logger.info(
+                "Telegram message: user_id=%s, text=%r",
+                (
+                    incoming_message.from_user.id
+                    if incoming_message.from_user
+                    else None
+                ),
+                incoming_message.text,
+            )
+
         with db.transaction():
             cursor = db.execute(
                 """
@@ -1424,17 +1258,14 @@ def telegram_webhook():
                 )
                 VALUES (?, 'processing', ?)
                 """,
-                (
-                    update_id,
-                    utc_now(),
-                ),
+                (update_id, utc_now()),
             )
 
             inserted = cursor.rowcount == 1
 
         if not inserted:
             logger.info(
-                "Повторное Telegram update пропущено: %s",
+                "Повторное обновление пропущено: %s",
                 update_id,
             )
 
@@ -1443,15 +1274,8 @@ def telegram_webhook():
                 "duplicate": True,
             }), 200
 
-        logger.info(
-            "Получено обновление Telegram: update_id=%s",
-            update_id,
-        )
-
         try:
-            bot.process_new_updates([
-                update
-            ])
+            bot.process_new_updates([update])
 
             db.execute(
                 """
@@ -1461,10 +1285,12 @@ def telegram_webhook():
                     error = NULL
                 WHERE update_id = ?
                 """,
-                (
-                    utc_now(),
-                    update_id,
-                ),
+                (utc_now(), update_id),
+            )
+
+            logger.info(
+                "Обновление успешно обработано: id=%s",
+                update_id,
             )
 
         except Exception as exc:
@@ -1480,10 +1306,7 @@ def telegram_webhook():
                     error = ?
                 WHERE update_id = ?
                 """,
-                (
-                    str(exc)[:1000],
-                    update_id,
-                ),
+                (str(exc)[:1000], update_id),
             )
 
             return jsonify({
@@ -1491,18 +1314,11 @@ def telegram_webhook():
                 "error": "Update processing failed",
             }), 500
 
-        return jsonify({
-            "ok": True,
-        }), 200
+        return jsonify({"ok": True}), 200
 
     except Exception:
-        logger.exception(
-            "Ошибка обработки webhook"
-        )
-
-        return jsonify({
-            "ok": False,
-        }), 500
+        logger.exception("Ошибка обработки webhook")
+        return jsonify({"ok": False}), 500
 
 
 # ---------------------------------------------------------
@@ -1512,14 +1328,10 @@ def telegram_webhook():
 @app.get("/")
 def index():
     try:
-        return app.send_static_file(
-            "index.html"
-        )
+        return app.send_static_file("index.html")
 
     except Exception:
-        logger.exception(
-            "Не удалось открыть static/index.html"
-        )
+        logger.exception("Не удалось открыть static/index.html")
 
         return jsonify({
             "ok": False,
@@ -1545,10 +1357,7 @@ def not_found(_error):
 
 @app.errorhandler(500)
 def internal_error(error):
-    logger.error(
-        "Ошибка Flask: %s",
-        error,
-    )
+    logger.error("Ошибка Flask: %s", error)
 
     return jsonify({
         "ok": False,
@@ -1562,21 +1371,15 @@ def internal_error(error):
 
 def configure_webhook():
     if not config.AUTO_SET_WEBHOOK:
-        logger.info(
-            "Автоматическая установка webhook отключена"
-        )
+        logger.info("Автоматическая установка webhook отключена")
         return
 
     if not config.WEBHOOK_URL:
-        logger.error(
-            "WEBHOOK_URL не задан"
-        )
+        logger.error("WEBHOOK_URL не задан")
         return
 
     if not config.WEBHOOK_SECRET:
-        logger.error(
-            "WEBHOOK_SECRET не задан"
-        )
+        logger.error("WEBHOOK_SECRET не задан")
         return
 
     base_url = (
@@ -1588,17 +1391,12 @@ def configure_webhook():
     suffix = "/telegram/webhook"
 
     while base_url.endswith(suffix):
-        base_url = (
-            base_url[:-len(suffix)]
-            .rstrip("/")
-        )
+        base_url = base_url[:-len(suffix)].rstrip("/")
 
     webhook_url = base_url + suffix
 
     if not webhook_url.startswith("https://"):
-        logger.error(
-            "WEBHOOK_URL должен начинаться с https://"
-        )
+        logger.error("WEBHOOK_URL должен начинаться с https://")
         return
 
     try:
@@ -1609,19 +1407,12 @@ def configure_webhook():
         )
 
         if result:
-            logger.info(
-                "Webhook установлен: %s",
-                webhook_url,
-            )
+            logger.info("Webhook установлен: %s", webhook_url)
         else:
-            logger.error(
-                "Telegram не подтвердил установку webhook"
-            )
+            logger.error("Telegram не подтвердил установку webhook")
 
     except Exception:
-        logger.exception(
-            "Не удалось установить webhook"
-        )
+        logger.exception("Не удалось установить webhook")
 
 
 if config.AUTO_SET_WEBHOOK:
