@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Gold Star</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-wrap">
+        <span class="brand-badge">★</span>
+        <div>
+          <div id="brandTitle" class="brand-title">GOLD STAR</div>
+          <div class="brand-sub">Stars · Premium · Gifts</div>
+        </div>
+      </div>
+      <div id="userChip" class="user-chip">Гость</div>
+    </header>
+
+    <main id="mainContent" class="main-content">
+      <div id="authNotice" class="banner banner-warn hidden">
+        Откройте магазин внутри Telegram Mini App для работы с балансом, заявками на пополнение и заказами.
+      </div>
+
+      <!-- 1. ГЛАВНАЯ -->
+      <section id="tab-home" class="tab-panel active">
+        <div class="wallet-card gold-glow">
+          <div class="wallet-label">Основной баланс</div>
+          <div id="homeBalance" class="wallet-amount">0 UZS</div>
+          <div class="wallet-bonus-row">
+            <span>Бонусный баланс:</span>
+            <strong id="homeBonus">0 UZS</strong>
+          </div>
+          <div class="wallet-actions">
+            <button id="openTopupBtn" class="btn btn-gold" type="button">+ Пополнить баланс</button>
+            <button id="goCatalogBtn" class="btn btn-ghost" type="button">Каталог</button>
+          </div>
+        </div>
+
+        <div class="section-head">
+          <h2>Категории</h2>
+          <span class="muted">Из каталога магазина</span>
+        </div>
+        <div id="homeCategories" class="quick-grid"></div>
+
+        <div class="section-head">
+          <h2>Популярные позиции</h2>
+          <button class="link-btn" type="button" data-jump-tab="catalog">Все товары →</button>
+        </div>
+        <div id="homePopular" class="product-list"></div>
+      </section>
+
+      <!-- 2. КАТАЛОГ -->
+      <section id="tab-catalog" class="tab-panel">
+        <div class="section-head">
+          <h2>Каталог</h2>
+          <span class="muted">Актуальные цены сервера</span>
+        </div>
+        <div id="categoryFilterBar" class="filter-bar"></div>
+        <div id="catalogList" class="product-list"></div>
+      </section>
+
+      <!-- 3. РЕЙТИНГ -->
+      <section id="tab-rating" class="tab-panel">
+        <div class="section-head">
+          <h2>Рейтинг</h2>
+        </div>
+        <div class="empty-card">
+          <div class="empty-icon">🏆</div>
+          <h3>Рейтинг пока не сформирован</h3>
+          <p class="muted">Данные рейтинга появятся после подключения публичной статистики покупок и активности.</p>
+        </div>
+      </section>
+
+      <!-- 4. РЕФЕРАЛЫ -->
+      <section id="tab-referrals" class="tab-panel">
+        <div class="section-head">
+          <h2>Рефералы</h2>
+        </div>
+        <div class="empty-card">
+          <div class="empty-icon">🤝</div>
+          <h3>Реферальная программа в разработке</h3>
+          <p class="muted">Приглашённые пользователи и реферальные начисления будут отображаться здесь после запуска программы.</p>
+        </div>
+      </section>
+
+      <!-- 5. ПРОФИЛЬ -->
+      <section id="tab-profile" class="tab-panel">
+        <div class="profile-card">
+          <div id="profileName" class="profile-name">Пользователь</div>
+          <div id="profileHandle" class="muted">@username · ID: —</div>
+          <div class="stats-row">
+            <div class="stat-box">
+              <div class="muted">Баланс</div>
+              <div id="profileBalance" class="stat-val">0 UZS</div>
+            </div>
+            <div class="stat-box">
+              <div class="muted">Бонусы</div>
+              <div id="profileBonus" class="stat-val">0 UZS</div>
+            </div>
+            <div class="stat-box">
+              <div class="muted">Заказов</div>
+              <div id="profileOrdersCount" class="stat-val">0</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6. ДОСТИЖЕНИЯ -->
+      <section id="tab-achievements" class="tab-panel">
+        <div class="section-head">
+          <h2>Достижения</h2>
+        </div>
+        <div class="empty-card">
+          <div class="empty-icon">🎖️</div>
+          <h3>Достижений пока нет</h3>
+          <p class="muted">Система наград и достижений появится в следующих обновлениях магазина.</p>
+        </div>
+      </section>
+
+      <!-- 7. ИСТОРИЯ ОПЕРАЦИЙ -->
+      <section id="tab-history" class="tab-panel">
+        <div class="section-head">
+          <h2>История операций</h2>
+          <button id="refreshHistoryBtn" class="link-btn" type="button">Обновить</button>
+        </div>
+
+        <h3 class="sub-head">Заявки на пополнение</h3>
+        <div id="topupsHistoryList" class="history-list"></div>
+
+        <h3 class="sub-head">Заказы</h3>
+        <div id="ordersHistoryList" class="history-list"></div>
+
+        <h3 class="sub-head">Движение средств</h3>
+        <div id="txHistoryList" class="history-list"></div>
+      </section>
+
+      <!-- 8. НАСТРОЙКИ -->
+      <section id="tab-settings" class="tab-panel">
+        <div class="section-head">
+          <h2>Настройки</h2>
+        </div>
+        <div class="settings-card">
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Валюта кошелька</div>
+              <div class="muted">Узбекский сум (UZS)</div>
+            </div>
+            <span class="pill-gold">UZS</span>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Лимиты пополнения</div>
+              <div id="settingsLimits" class="muted">Загрузка...</div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div>
+              <div class="setting-title">Поддержка и отправка чеков</div>
+              <div class="muted">Чеки на пополнение отправляются в чат с ботом</div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Нижняя навигация (8 разделов) -->
+    <nav class="bottom-nav" aria-label="Навигация">
+      <button class="nav-btn active" type="button" data-tab="home">
+        <span>🏠</span><small>Главная</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="catalog">
+        <span>🛍</span><small>Каталог</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="rating">
+        <span>🏆</span><small>Рейтинг</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="referrals">
+        <span>🤝</span><small>Рефералы</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="profile">
+        <span>👤</span><small>Профиль</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="achievements">
+        <span>🎖️</span><small>Достижения</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="history">
+        <span>🧾</span><small>История</small>
+      </button>
+      <button class="nav-btn" type="button" data-tab="settings">
+        <span>⚙️</span><small>Настройки</small>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Модальное окно пополнения баланса -->
+  <div id="topupModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3>Пополнение баланса</h3>
+        <button id="closeTopupModal" class="icon-btn" type="button">✕</button>
+      </div>
+      <p id="topupLimitsHint" class="muted"></p>
+      <label class="field-label" for="topupAmountInput">Сумма в UZS</label>
+      <input id="topupAmountInput" class="input" type="number" min="1" step="1" placeholder="Например, 50000" />
+      <button id="submitTopupBtn" class="btn btn-gold full-w" type="button">Создать заявку</button>
+
+      <div id="topupRequisitesBox" class="req-box hidden">
+        <div class="req-title">Реквизиты для перевода</div>
+        <pre id="topupRequisitesText" class="req-pre"></pre>
+        <p class="muted">После перевода отправьте скриншот или фото чека в чат с ботом. Средства зачислятся только после проверки администратором.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно покупки товара -->
+  <div id="orderModal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h3 id="orderModalTitle">Оформление заказа</h3>
+        <button id="closeOrderModal" class="icon-btn" type="button">✕</button>
+      </div>
+      <p id="orderModalDesc" class="muted"></p>
+      <div id="orderModalPrice" class="modal-price">0 UZS</div>
+
+      <label class="field-label" for="orderRecipientInput">@username получателя</label>
+      <input id="orderRecipientInput" class="input" type="text" placeholder="@username" />
+
+      <label class="field-label" for="orderQtyInput">Количество</label>
+      <input id="orderQtyInput" class="input" type="number" min="1" max="50" value="1" />
+
+      <button id="confirmOrderBtn" class="btn btn-gold full-w" type="button">Оплатить с баланса</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
