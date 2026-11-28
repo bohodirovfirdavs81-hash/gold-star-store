@@ -5,8 +5,8 @@ Gold Star Store — API для Telegram Mini App.
 Flask Blueprint:
 - проверка Telegram WebApp initData;
 - профиль и кошелёк;
-- каталог;
-- история заказов;
+- каталог товаров;
+- история заказов и транзакций;
 - оформление заказов;
 - заявки на пополнение.
 """
@@ -58,11 +58,6 @@ def error(message, status=400):
 # --------------------------------------------------
 
 def validate_init_data(init_data: str) -> dict:
-    """
-    Проверяет подпись Telegram WebApp initData.
-    Возвращает проверенные данные.
-    """
-
     if not init_data or not isinstance(init_data, str):
         raise ValueError("Отсутствуют данные Telegram")
 
@@ -75,14 +70,17 @@ def validate_init_data(init_data: str) -> dict:
             keep_blank_values=True,
             strict_parsing=True,
         )
-    except ValueError:
-        raise ValueError("Некорректный initData")
+    except ValueError as exc:
+        raise ValueError("Некорректный initData") from exc
 
     data = {}
 
     for key, value in pairs:
         if key in data:
-            raise ValueError("Повторяющиеся параметры initData")
+            raise ValueError(
+                "Повторяющиеся параметры initData"
+            )
+
         data[key] = value
 
     received_hash = data.pop("hash", None)
@@ -91,9 +89,13 @@ def validate_init_data(init_data: str) -> dict:
         r"[0-9a-fA-F]{64}",
         received_hash,
     ):
-        raise ValueError("Отсутствует подпись Telegram")
+        raise ValueError(
+            "Отсутствует подпись Telegram"
+        )
 
-    bot_token = getattr(config, "BOT_TOKEN", "")
+    bot_token = str(
+        getattr(config, "BOT_TOKEN", "") or ""
+    ).strip()
 
     if not bot_token:
         raise ValueError("BOT_TOKEN не настроен")
@@ -119,32 +121,51 @@ def validate_init_data(init_data: str) -> dict:
         calculated_hash,
         received_hash.lower(),
     ):
-        raise ValueError("Недействительная подпись Telegram")
+        raise ValueError(
+            "Недействительная подпись Telegram"
+        )
 
     try:
         auth_date = int(data.get("auth_date", "0"))
-    except (TypeError, ValueError):
-        raise ValueError("Некорректная дата авторизации")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Некорректная дата авторизации"
+        ) from exc
 
     now = int(time.time())
 
-    max_age = int(
-        getattr(config, "INIT_DATA_MAX_AGE_SEC", 86400)
-    )
+    try:
+        max_age = int(
+            getattr(
+                config,
+                "INIT_DATA_MAX_AGE_SEC",
+                86400,
+            )
+        )
+    except (TypeError, ValueError):
+        max_age = 86400
 
     if auth_date <= 0 or auth_date > now + 60:
-        raise ValueError("Некорректная дата авторизации")
+        raise ValueError(
+            "Некорректная дата авторизации"
+        )
 
-    if now - auth_date > max_age:
-        raise ValueError("Срок действия авторизации истёк")
+    if max_age <= 0 or now - auth_date > max_age:
+        raise ValueError(
+            "Срок действия авторизации истёк"
+        )
 
     try:
         user = json.loads(data.get("user", "{}"))
-    except (TypeError, ValueError):
-        raise ValueError("Некорректные данные пользователя")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Некорректные данные пользователя"
+        ) from exc
 
     if not isinstance(user, dict):
-        raise ValueError("Некорректные данные пользователя")
+        raise ValueError(
+            "Некорректные данные пользователя"
+        )
 
     try:
         user_id = int(user.get("id", 0))
@@ -152,7 +173,9 @@ def validate_init_data(init_data: str) -> dict:
         user_id = 0
 
     if user_id <= 0:
-        raise ValueError("Не удалось определить пользователя")
+        raise ValueError(
+            "Не удалось определить пользователя"
+        )
 
     user["id"] = user_id
 
@@ -164,7 +187,7 @@ def validate_init_data(init_data: str) -> dict:
 
 
 # --------------------------------------------------
-# АВТОРИЗАЦИЯ API
+# АВТОРИЗАЦИЯ
 # --------------------------------------------------
 
 def require_telegram_user(function):
@@ -176,13 +199,13 @@ def require_telegram_user(function):
         )
 
         if not init_data:
-            init_data = request.headers.get(
+            authorization = request.headers.get(
                 "Authorization",
                 "",
             )
 
-            if init_data.lower().startswith("tma "):
-                init_data = init_data[4:]
+            if authorization.lower().startswith("tma "):
+                init_data = authorization[4:]
 
         try:
             verified = validate_init_data(init_data)
@@ -200,35 +223,54 @@ def require_telegram_user(function):
             return error(str(exc), 401)
 
         except Exception:
-            logger.exception("Ошибка авторизации Mini App")
-            return error("Ошибка авторизации", 500)
+            logger.exception(
+                "Ошибка авторизации Mini App"
+            )
+
+            return error(
+                "Ошибка авторизации",
+                500,
+            )
 
     return wrapper
 
 
-def _user_id():
+def _user_id() -> int:
     return int(g.telegram_user_id)
 
 
-def _body():
+def _body() -> dict:
     data = request.get_json(silent=True)
+
     return data if isinstance(data, dict) else {}
 
 
-def _positive_int(value, name, maximum=10**12):
+def _positive_int(
+    value,
+    name: str,
+    maximum: int = 10**12,
+) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"Некорректное значение: {name}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Некорректное значение: {name}"
+        ) from exc
 
     if number <= 0 or number > maximum:
-        raise ValueError(f"Недопустимое значение: {name}")
+        raise ValueError(
+            f"Недопустимое значение: {name}"
+        )
 
     return number
 
 
+def _dict_or_empty(value):
+    return dict(value) if value else {}
+
+
 # --------------------------------------------------
-# ПРОВЕРКА РАБОТЫ API
+# HEALTH
 # --------------------------------------------------
 
 @api.get("/health")
@@ -240,7 +282,7 @@ def health():
 
 
 # --------------------------------------------------
-# ПРОФИЛЬ И КОШЕЛЁК
+# ПРОФИЛЬ
 # --------------------------------------------------
 
 @api.get("/me")
@@ -252,13 +294,73 @@ def me():
     wallet = db.get_wallet(user_id)
 
     if not user:
-        return error("Пользователь не найден", 404)
+        return error(
+            "Пользователь не найден",
+            404,
+        )
 
-    return success({
-        "user": dict(user),
-        "wallet": dict(wallet) if wallet else {
+    wallet_data = _dict_or_empty(wallet)
+
+    if not wallet_data:
+        wallet_data = {
             "balance_uzs": 0,
             "bonus_uzs": 0,
+        }
+
+    order_stats = db.q_one(
+        """
+        SELECT
+            COUNT(*) AS total_orders,
+            SUM(
+                CASE
+                    WHEN status = 'delivered' THEN 1
+                    ELSE 0
+                END
+            ) AS completed_orders
+        FROM wallet_orders
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+
+    stats = {
+        "total_orders": 0,
+        "completed_orders": 0,
+    }
+
+    if order_stats:
+        stats["total_orders"] = int(
+            order_stats["total_orders"] or 0
+        )
+
+        stats["completed_orders"] = int(
+            order_stats["completed_orders"] or 0
+        )
+
+    return success({
+        "brand": getattr(
+            config,
+            "BRAND",
+            "Gold Star Store",
+        ),
+        "user": dict(user),
+        "wallet": wallet_data,
+        "stats": stats,
+        "topup_config": {
+            "minimum": int(
+                getattr(
+                    config,
+                    "TOPUP_MIN_UZS",
+                    1000,
+                )
+            ),
+            "maximum": int(
+                getattr(
+                    config,
+                    "TOPUP_MAX_UZS",
+                    100000000,
+                )
+            ),
         },
     })
 
@@ -270,7 +372,7 @@ def me():
 @api.get("/categories")
 @require_telegram_user
 def categories():
-    rows = shop.get_categories(active_only=True)
+    rows = shop.get_categories()
 
     return success([
         dict(row) for row in rows
@@ -278,7 +380,7 @@ def categories():
 
 
 # --------------------------------------------------
-# КАТАЛОГ ТОВАРОВ
+# ТОВАРЫ
 # --------------------------------------------------
 
 @api.get("/products")
@@ -286,14 +388,35 @@ def categories():
 def products():
     category = request.args.get("category")
 
-    rows = shop.get_products(
-        category_slug=category or None,
-        active_only=True,
-    )
+    try:
+        limit = _positive_int(
+            request.args.get("limit", 100),
+            "limit",
+            maximum=100,
+        )
 
-    return success([
-        dict(row) for row in rows
-    ])
+        offset = int(
+            request.args.get("offset", 0)
+        )
+
+        if offset < 0:
+            raise ValueError(
+                "Некорректное значение: offset"
+            )
+
+        rows = shop.get_products(
+            category_slug=category or None,
+            active_only=True,
+            limit=limit,
+            offset=offset,
+        )
+
+        return success([
+            dict(row) for row in rows
+        ])
+
+    except ValueError as exc:
+        return error(str(exc))
 
 
 @api.get("/products/<int:product_id>")
@@ -301,30 +424,72 @@ def products():
 def product_details(product_id):
     product = shop.get_product(product_id)
 
-    if not product or not product["active"]:
-        return error("Товар не найден", 404)
+    if not product:
+        return error(
+            "Товар не найден",
+            404,
+        )
 
-    return success(dict(product))
+    product_data = dict(product)
+
+    if not product_data.get("active"):
+        return error(
+            "Товар недоступен",
+            404,
+        )
+
+    return success(product_data)
 
 
 # --------------------------------------------------
-# ИСТОРИЯ ЗАКАЗОВ
+# ИСТОРИЯ
 # --------------------------------------------------
 
 @api.get("/history")
 @require_telegram_user
 def history():
-    rows = shop.get_user_orders(_user_id())
+    user_id = _user_id()
 
-    return success([
-        dict(row) for row in rows
-    ])
+    orders = shop.list_wallet_orders(
+        user_id,
+        limit=100,
+    )
+
+    topups = payments.get_user_topups(
+        user_id,
+    )
+
+    transactions = db.q_all(
+        """
+        SELECT *
+        FROM wallet_transactions
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    )
+
+    return success({
+        "orders": [
+            dict(row) for row in orders
+        ],
+        "topups": [
+            dict(row) for row in topups
+        ],
+        "transactions": [
+            dict(row) for row in transactions
+        ],
+    })
 
 
 @api.get("/orders")
 @require_telegram_user
 def orders():
-    rows = shop.get_user_orders(_user_id())
+    rows = shop.list_wallet_orders(
+        _user_id(),
+        limit=100,
+    )
 
     return success([
         dict(row) for row in rows
@@ -334,13 +499,19 @@ def orders():
 @api.get("/orders/<int:order_id>")
 @require_telegram_user
 def order_details(order_id):
-    order = shop.get_order(order_id)
+    order = shop.get_wallet_order(order_id)
 
     if not order:
-        return error("Заказ не найден", 404)
+        return error(
+            "Заказ не найден",
+            404,
+        )
 
     if int(order["user_id"]) != _user_id():
-        return error("Заказ не найден", 404)
+        return error(
+            "Заказ не найден",
+            404,
+        )
 
     return success(dict(order))
 
@@ -361,9 +532,12 @@ def create_order():
         )
 
         quantity = _positive_int(
-            data.get("quantity", data.get("qty", 1)),
+            data.get(
+                "quantity",
+                data.get("qty", 1),
+            ),
             "quantity",
-            maximum=100,
+            maximum=50,
         )
 
         recipient = str(
@@ -375,10 +549,14 @@ def create_order():
         ).strip()
 
         if not idempotency_key:
-            return error("Отсутствует ключ заказа")
+            return error(
+                "Отсутствует ключ заказа"
+            )
 
         if len(idempotency_key) > 128:
-            return error("Некорректный ключ заказа")
+            return error(
+                "Некорректный ключ заказа"
+            )
 
         result = shop.create_wallet_order(
             user_id=_user_id(),
@@ -397,22 +575,30 @@ def create_order():
     except ValueError as exc:
         return error(str(exc))
 
-    except PermissionError as exc:
-        return error(str(exc), 403)
+    except shop.ShopError as exc:
+        return error(str(exc))
 
     except Exception:
-        logger.exception("Ошибка создания заказа")
-        return error("Не удалось оформить заказ", 500)
+        logger.exception(
+            "Ошибка создания заказа"
+        )
+
+        return error(
+            "Не удалось оформить заказ",
+            500,
+        )
 
 
 # --------------------------------------------------
-# ЗАПРОСЫ НА ПОПОЛНЕНИЕ
+# ПОПОЛНЕНИЯ
 # --------------------------------------------------
 
 @api.get("/topups")
 @require_telegram_user
 def topups():
-    rows = payments.get_user_topups(_user_id())
+    rows = payments.get_user_topups(
+        _user_id(),
+    )
 
     return success([
         dict(row) for row in rows
@@ -426,21 +612,33 @@ def create_topup():
 
     try:
         amount = _positive_int(
-            data.get("amount_uzs", data.get("amount")),
+            data.get(
+                "amount_uzs",
+                data.get("amount"),
+            ),
             "amount",
         )
 
         minimum = int(
-            getattr(config, "TOPUP_MIN_UZS", 1000)
+            getattr(
+                config,
+                "TOPUP_MIN_UZS",
+                1000,
+            )
         )
 
         maximum = int(
-            getattr(config, "TOPUP_MAX_UZS", 100000000)
+            getattr(
+                config,
+                "TOPUP_MAX_UZS",
+                100000000,
+            )
         )
 
         if amount < minimum or amount > maximum:
             return error(
-                f"Сумма должна быть от {minimum} до {maximum} сум"
+                f"Сумма должна быть от "
+                f"{minimum} до {maximum} сум"
             )
 
         idempotency_key = str(
@@ -448,10 +646,14 @@ def create_topup():
         ).strip()
 
         if not idempotency_key:
-            return error("Отсутствует ключ заявки")
+            return error(
+                "Отсутствует ключ заявки"
+            )
 
         if len(idempotency_key) > 128:
-            return error("Некорректный ключ заявки")
+            return error(
+                "Некорректный ключ заявки"
+            )
 
         result = payments.create_topup(
             user_id=_user_id(),
@@ -459,8 +661,22 @@ def create_topup():
             idempotency_key=idempotency_key,
         )
 
+        topup_data = dict(result)
+
+        # Реквизиты только для ручного пополнения.
+        requisites = str(
+            getattr(
+                config,
+                "TOPUP_REQUISITES",
+                "",
+            ) or ""
+        )
+
+        response_data = dict(topup_data)
+        response_data["requisites"] = requisites
+
         return success(
-            result,
+            response_data,
             "Заявка на пополнение создана",
             201,
         )
@@ -469,12 +685,18 @@ def create_topup():
         return error(str(exc))
 
     except Exception:
-        logger.exception("Ошибка создания пополнения")
-        return error("Не удалось создать заявку", 500)
+        logger.exception(
+            "Ошибка создания пополнения"
+        )
+
+        return error(
+            "Не удалось создать заявку",
+            500,
+        )
 
 
 # --------------------------------------------------
-# ИНФОРМАЦИЯ О ПОПОЛНЕНИИ
+# ДЕТАЛИ ПОПОЛНЕНИЯ
 # --------------------------------------------------
 
 @api.get("/topups/<int:topup_id>")
@@ -483,29 +705,48 @@ def topup_details(topup_id):
     topup = payments.get_topup(topup_id)
 
     if not topup:
-        return error("Заявка не найдена", 404)
+        return error(
+            "Заявка не найдена",
+            404,
+        )
 
     if int(topup["user_id"]) != _user_id():
-        return error("Заявка не найдена", 404)
+        return error(
+            "Заявка не найдена",
+            404,
+        )
 
     return success(dict(topup))
 
 
 # --------------------------------------------------
-# ОБРАБОТКА ОШИБОК
+# ОШИБКИ
 # --------------------------------------------------
 
 @api.errorhandler(404)
 def not_found(_exc):
-    return error("Маршрут не найден", 404)
+    return error(
+        "Маршрут не найден",
+        404,
+    )
 
 
 @api.errorhandler(405)
 def method_not_allowed(_exc):
-    return error("Метод не поддерживается", 405)
+    return error(
+        "Метод не поддерживается",
+        405,
+    )
 
 
 @api.errorhandler(Exception)
 def internal_error(exc):
-    logger.exception("Необработанная ошибка API: %s", exc)
-    return error("Внутренняя ошибка сервера", 500)
+    logger.exception(
+        "Необработанная ошибка API: %s",
+        exc,
+    )
+
+    return error(
+        "Внутренняя ошибка сервера",
+        500,
+    )
